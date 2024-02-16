@@ -1,0 +1,23 @@
+[package]
+name = "used-kinds-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.79"
+axum = "0.7.4"
+chrono = { version = "0.4.34", features = ["serde"] }
+config = "0.13.4"
+env_logger = "0.11.1"
+handlebars = "5.1.0"
+log = "0.4.20"
+nostr-sdk = "0.28.0"
+serde = { version = "1.0.196", features = ["derive"] }
+serde_json = "1.0.113"
+tokio = { version = "1.35.1", features = ["full", "net"] }
+tokio-util = { version = "0.7.10", features = ["rt", "net"] }
+tower-http = { version = "0.5.1", features = ["timeout", "trace"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Undocumented Nostr Kinds</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 40px;
+            background-color: #f4f4f4;
+            color: #333;
+        }
+
+        h1 {
+            color: #333;
+        }
+
+        .table-responsive {
+            overflow-x: auto; /* Allows table to scroll horizontally */
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        th, td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+
+        th {
+            background-color: #007bff;
+            color: #ffffff;
+            text-transform: uppercase;
+        }
+
+        tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+
+        tr:hover {
+            background-color: #f1f1f1;
+        }
+
+        a {
+            color: #007bff;
+            text-decoration: none;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+
+        .footer {
+            margin-top: 40px;
+            text-align: center;
+            color: #777;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                margin: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <h1>Undocumented Nostr Kinds</h1>
+    <h2>List of Kinds Not Described by any NIPs</h2>
+    <p>Note: Kinds not seen for a month are removed from the list.</p>
+    <div class="table-responsive">
+        <table>
+            <thead>
+                <tr>
+                    <th>Kind</th>
+                    <th>Event ID</th>
+                    <th>Seen Times</th>
+                    <th>Last Seen At</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{#each stats}}
+                <tr>
+                    <td>{{this.[0]}}</td>
+                    <td><a href="https://njump.me/{{this.[1].event_id}}" target="_blank">{{this.[1].event_id}}</a></td>
+                    <td>{{this.[1].count}}</td>
+                    <td>{{date this.[1].last_updated}}</td>
+                </tr>
+                {{/each}}
+            </tbody>
+        </table>
+    </div>
+    <div class="footer">
+        <p>Data provided by Nostr network analysis.</p>
+    </div>
+</body>
+</html>
