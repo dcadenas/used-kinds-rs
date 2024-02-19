@@ -17,12 +17,8 @@ COPY --from=builder /used-kinds-rs/target/release/used-kinds-rs .
 
 COPY --from=builder /used-kinds-rs/templates /templates
 
-RUN mkdir /data
-
 EXPOSE 8080
 
-VOLUME ["/data"]
+VOLUME ["/var/data"]
 
 ENTRYPOINT ["./used-kinds-rs"]
-
-CMD ["--stats-file", "/data/stats.json"]

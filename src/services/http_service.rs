@@ -104,7 +104,7 @@ async fn fetch_stats(
     _: HeaderMap,
     State(AppState { hb, .. }): State<AppState>,
 ) -> impl IntoResponse {
-    match read_to_string("data/stats.json").await {
+    match read_to_string("/var/data/stats.json").await {
         Ok(content) => {
             let stats: HashMap<String, Stat> = serde_json::from_str(&content).unwrap_or_default();
             let mut stats_vec: Vec<(String, Stat)> = stats.into_iter().collect();

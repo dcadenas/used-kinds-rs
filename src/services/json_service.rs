@@ -28,7 +28,7 @@ impl JsonService {
         cancellation_token: CancellationToken,
         new_kind_event_rx: broadcast::Receiver<(Event, Url)>,
     ) -> Result<Self> {
-        let json_str = tokio::fs::read_to_string("data/stats.json")
+        let json_str = tokio::fs::read_to_string("/var/data/stats.json")
             .await
             .unwrap_or_else(|_| "{}".to_string());
         let mut kind_stats: HashMap<u32, KindEntry> =
@@ -49,7 +49,7 @@ impl JsonService {
 
     async fn save_stats_to_json(&self) -> Result<()> {
         let json_str = serde_json::to_string_pretty(&self.kind_stats)?;
-        tokio::fs::write("data/stats.json", json_str).await?;
+        tokio::fs::write("/var/data/stats.json", json_str).await?;
         Ok(())
     }
 
@@ -61,7 +61,7 @@ impl JsonService {
                     self.save_stats_to_json().await?;
                 },
                 _ = self.cancellation_token.cancelled() => {
-                    info!("Broadcast saver exited");
+                    info!("Cancellation token received, stopping the json service");
                     break;
                 },
                 recv_result = self.new_kind_event_rx.recv() => {
