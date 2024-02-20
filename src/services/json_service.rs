@@ -4,10 +4,11 @@ use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tokio::sync::broadcast;
-use tokio::time::{sleep, Duration};
+use std::sync::Arc;
+use tokio::sync::{broadcast, Mutex};
+use tokio::time::{interval, Duration};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Serialize, Deserialize)]
 struct KindEntry {
@@ -20,7 +21,7 @@ struct KindEntry {
 pub struct JsonService {
     cancellation_token: CancellationToken,
     new_kind_event_rx: broadcast::Receiver<(Event, Url)>,
-    kind_stats: HashMap<u32, KindEntry>,
+    kind_stats: Arc<Mutex<HashMap<u32, KindEntry>>>,
 }
 
 impl JsonService {
@@ -30,7 +31,11 @@ impl JsonService {
     ) -> Result<Self> {
         let json_str = tokio::fs::read_to_string("/var/data/stats.json")
             .await
-            .unwrap_or_else(|_| "{}".to_string());
+            .unwrap_or_else(|e| {
+                error!("Failed to read stats file, defaulting to empty: {}", e);
+                "{}".to_string()
+            });
+
         let mut kind_stats: HashMap<u32, KindEntry> =
             serde_json::from_str(&json_str).unwrap_or_default();
 
@@ -42,52 +47,75 @@ impl JsonService {
 
         Ok(JsonService {
             cancellation_token,
-            new_kind_event_rx,
-            kind_stats,
+            new_kind_event_rx: new_kind_event_rx,
+            kind_stats: Arc::new(Mutex::new(kind_stats)),
         })
     }
 
-    async fn save_stats_to_json(&self) -> Result<()> {
-        let json_str = serde_json::to_string_pretty(&self.kind_stats)?;
+    async fn save_stats_to_json(
+        kind_stats_arc: &Arc<Mutex<HashMap<u32, KindEntry>>>,
+    ) -> Result<()> {
+        let kind_stats = kind_stats_arc.lock().await;
+        let json_str = serde_json::to_string_pretty(&*kind_stats)?;
         tokio::fs::write("/var/data/stats.json", json_str).await?;
         Ok(())
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        loop {
-            tokio::select! {
-                _ = sleep(Duration::from_secs(60 * 5)) => {
-                    info!("Saving the stats to json file");
-                    self.save_stats_to_json().await?;
-                },
-                _ = self.cancellation_token.cancelled() => {
-                    info!("Cancellation token received, stopping the json service");
-                    break;
-                },
-                recv_result = self.new_kind_event_rx.recv() => {
-                    if let Ok((new_kind_event, relay_url)) = recv_result {
-                        let relay_urls = vec![relay_url.to_string()];
-                        let event_id = match Nip19Event::new(new_kind_event.id, relay_urls).to_bech32() {
-                            Ok(id) => id,
-                            Err(e) => {
-                                warn!("Error converting event ID to bech32: {:?}", e);
-                                continue;
-                            }
-                        };
+        let cancellation_token = self.cancellation_token.clone();
+        let kind_stats = self.kind_stats.clone();
 
-                        self.kind_stats.entry(new_kind_event.kind.as_u32())
-                        .and_modify(|e| {
-                            e.count += 1;
-                            e.last_updated = Utc::now();
-                        })
-                        .or_insert_with(|| KindEntry {
-                            event_id: event_id,
-                            count: 1,
-                            last_updated: Utc::now(),
-                        });
-
+        tokio::spawn(async move {
+            let mut task_interval = interval(Duration::from_secs(60));
+            while !cancellation_token.is_cancelled() {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        info!("Cancellation token received, stopping the json service");
+                        break;
+                    },
+                    _ = task_interval.tick() => {
+                        info!("Saving the stats to json file");
+                        if let Err(err) = JsonService::save_stats_to_json(&kind_stats).await {
+                            error!("Error saving stats to json file: {:?}", err);
+                        }
                     }
-                },
+                }
+            }
+        });
+
+        loop {
+            {
+                tokio::select! {
+                    _ = self.cancellation_token.cancelled() => {
+                        info!("Cancellation token received, stopping the json service");
+                        break;
+                    },
+                    recv_result = self.new_kind_event_rx.recv() => {
+                        if let Ok((new_kind_event, relay_url)) = recv_result {
+                            let relay_urls = vec![relay_url.to_string()];
+                            let event_id = match Nip19Event::new(new_kind_event.id, relay_urls).to_bech32() {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    warn!("Error converting event ID to bech32: {:?}", e);
+                                    continue;
+                                }
+                            };
+
+                            let mut kind_stats = self.kind_stats.lock().await;
+                            kind_stats.entry(new_kind_event.kind.as_u32())
+                            .and_modify(|e| {
+                                e.count += 1;
+                                e.last_updated = Utc::now();
+                            })
+                            .or_insert_with(|| KindEntry {
+                                event_id: event_id,
+                                count: 1,
+                                last_updated: Utc::now(),
+                            });
+
+                        }
+                    },
+                }
             }
         }
         Ok(())

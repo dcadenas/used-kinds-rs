@@ -26,9 +26,11 @@ impl ServiceManager {
     {
         let token = self.token.clone();
         self.tracker.spawn(async move {
+            let token_clone = token.clone();
             let task_fut = task(token);
             if let Err(e) = task_fut.await {
                 log::error!("Task failed: {}", e);
+                token_clone.cancel();
             }
         })
     }
