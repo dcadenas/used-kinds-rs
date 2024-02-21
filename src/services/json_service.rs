@@ -1,6 +1,6 @@
 use crate::utils::is_kind_free;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use lazy_static::lazy_static;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -21,8 +21,7 @@ lazy_static! {
 struct KindEntry {
     event: Event,
     count: u64,
-    #[serde(with = "chrono::serde::ts_seconds")]
-    last_updated: DateTime<Utc>,
+    last_updated: i64,
 }
 
 pub struct JsonService {
@@ -51,7 +50,8 @@ impl JsonService {
 
         // Remove any entries that are older than 1 month or for which is_kind_free is false
         kind_stats.retain(|kind, entry| {
-            let is_old = entry.last_updated < Utc::now() - chrono::Duration::days(30);
+            let is_old =
+                entry.last_updated < (Utc::now() - chrono::Duration::days(30)).timestamp_millis();
             !is_old && is_kind_free(*kind)
         });
 
@@ -108,12 +108,12 @@ impl JsonService {
                             .and_modify(|e| {
                                 e.event = new_kind_event.clone();
                                 e.count += 1;
-                                e.last_updated = Utc::now();
+                                e.last_updated = Utc::now().timestamp_millis();
                             })
                             .or_insert_with(|| KindEntry {
                                 event: new_kind_event,
                                 count: 1,
-                                last_updated: Utc::now(),
+                                last_updated: Utc::now().timestamp_millis(),
                             });
 
                         }

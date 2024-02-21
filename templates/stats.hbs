@@ -104,6 +104,10 @@
         .sort-indicator {
             margin-left: 5px;
         }
+
+        .hidden {
+            display: none;
+        }
     </style>
 </head>
 
@@ -123,6 +127,7 @@
                     <th>Latest Event Sampled <span class="sort-indicator"></span></th>
                     <th>Seen Times <span class="sort-indicator"></span></th>
                     <th>Last Seen At <span class="sort-indicator"></span></th>
+                    <th class="hidden"></th>
                 </tr>
             </thead>
             <tbody>
@@ -138,6 +143,7 @@
                     </td>
                     <td>{{this.[1].count}}</td>
                     <td>{{date_relative this.[1].last_updated}}</td>
+                    <td class="hidden">{{this.[1].last_updated }}</td>
                 </tr>
                 <tr class="json-display-row" style="display: none;">
                     <td colspan="4" class="json-content"></td>
@@ -165,8 +171,16 @@
                 th.addEventListener('click', function () {
                     const table = th.closest('table');
                     const tbody = table.querySelector('tbody');
+                    let index = Array.from(th.parentNode.children).indexOf(th);
+
+                    // For now we just hardcode that if we select the human readable column we are
+                    // in fact sorting through the column that contains the timestamp number
+                    if (index === 3) {
+                        index = 4;
+                    }
+
                     Array.from(tbody.querySelectorAll('tr'))
-                        .sort(comparer(Array.from(th.parentNode.children).indexOf(th), this.asc = !this.asc))
+                        .sort(comparer(index, this.asc = !this.asc))
                         .forEach(tr => tbody.appendChild(tr));
 
                     // Clear existing indicators
