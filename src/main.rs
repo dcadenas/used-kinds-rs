@@ -6,9 +6,8 @@ use crate::services::json_service::JsonService;
 use crate::services::nostr_service::NostrService;
 use crate::services::service_manager::ServiceManager;
 use anyhow::Result;
-use log::info;
 use nostr_sdk::prelude::*;
-use tracing::error;
+use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]

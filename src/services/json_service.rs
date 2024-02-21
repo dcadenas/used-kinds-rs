@@ -1,18 +1,25 @@
 use crate::utils::is_kind_free;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use lazy_static::lazy_static;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::{interval, Duration};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info};
+
+lazy_static! {
+    static ref STATS_FILE: String =
+        env::var("STATS_FILE").unwrap_or_else(|_| "/var/data/stats.json".to_string());
+}
 
 #[derive(Serialize, Deserialize)]
 struct KindEntry {
-    event_id: String,
+    event: Event,
     count: u64,
     #[serde(with = "chrono::serde::ts_seconds")]
     last_updated: DateTime<Utc>,
@@ -29,15 +36,18 @@ impl JsonService {
         cancellation_token: CancellationToken,
         new_kind_event_rx: broadcast::Receiver<(Event, Url)>,
     ) -> Result<Self> {
-        let json_str = tokio::fs::read_to_string("/var/data/stats.json")
+        let json_str = tokio::fs::read_to_string(&*STATS_FILE)
             .await
             .unwrap_or_else(|e| {
                 error!("Failed to read stats file, defaulting to empty: {}", e);
                 "{}".to_string()
             });
 
-        let mut kind_stats: HashMap<u32, KindEntry> =
-            serde_json::from_str(&json_str).unwrap_or_default();
+        let mut kind_stats: HashMap<u32, KindEntry> = serde_json::from_str(&json_str)
+            .unwrap_or_else(|e| {
+                error!("Failed to read stats file, defaulting to empty: {}", e);
+                HashMap::default()
+            });
 
         // Remove any entries that are older than 1 month or for which is_kind_free is false
         kind_stats.retain(|kind, entry| {
@@ -57,7 +67,7 @@ impl JsonService {
     ) -> Result<()> {
         let kind_stats = kind_stats_arc.lock().await;
         let json_str = serde_json::to_string_pretty(&*kind_stats)?;
-        tokio::fs::write("/var/data/stats.json", json_str).await?;
+        tokio::fs::write(&*STATS_FILE, json_str).await?;
         Ok(())
     }
 
@@ -91,15 +101,7 @@ impl JsonService {
                         break;
                     },
                     recv_result = self.new_kind_event_rx.recv() => {
-                        if let Ok((new_kind_event, relay_url)) = recv_result {
-                            let relay_urls = vec![relay_url.to_string()];
-                            let event_id = match Nip19Event::new(new_kind_event.id, relay_urls).to_bech32() {
-                                Ok(id) => id,
-                                Err(e) => {
-                                    warn!("Error converting event ID to bech32: {:?}", e);
-                                    continue;
-                                }
-                            };
+                        if let Ok((new_kind_event, _relay_url)) = recv_result {
 
                             let mut kind_stats = self.kind_stats.lock().await;
                             kind_stats.entry(new_kind_event.kind.as_u32())
@@ -108,7 +110,7 @@ impl JsonService {
                                 e.last_updated = Utc::now();
                             })
                             .or_insert_with(|| KindEntry {
-                                event_id: event_id,
+                                event: new_kind_event,
                                 count: 1,
                                 last_updated: Utc::now(),
                             });

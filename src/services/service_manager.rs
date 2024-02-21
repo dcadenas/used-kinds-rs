@@ -1,10 +1,10 @@
 use anyhow::Result;
-use log::info;
 use tokio::macros::support::Future;
 use tokio::signal;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tracing::{error, info};
 
 pub struct ServiceManager {
     tracker: TaskTracker,
@@ -29,7 +29,7 @@ impl ServiceManager {
             let token_clone = token.clone();
             let task_fut = task(token);
             if let Err(e) = task_fut.await {
-                log::error!("Task failed: {}", e);
+                error!("Task failed: {}", e);
                 token_clone.cancel();
             }
         })

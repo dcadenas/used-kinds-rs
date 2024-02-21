@@ -1,6 +1,11 @@
 <!DOCTYPE html>
 <html>
+
 <head>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/default.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+
+
     <title>Undocumented Nostr Kinds</title>
     <style>
         body {
@@ -15,7 +20,7 @@
         }
 
         .table-responsive {
-            overflow-x: auto; /* Allows table to scroll horizontally */
+            overflow-x: auto;
         }
 
         table {
@@ -25,7 +30,8 @@
             box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
         }
 
-        th, td {
+        th,
+        td {
             padding: 12px 15px;
             text-align: left;
             border-bottom: 1px solid #ddd;
@@ -65,8 +71,25 @@
                 margin: 20px;
             }
         }
+
+        .json-content {
+            max-height: 400px;
+            /* Adjust based on your needs */
+            overflow: auto;
+            /* Allows scrolling */
+            white-space: pre-wrap;
+            /* Keeps formatting */
+            background-color: #f9f9f9;
+            border: 1px solid #ddd;
+            padding: 10px;
+            border-radius: 5px;
+            word-wrap: break-word;
+            font-size: 0.9em;
+            /* Optional: Adjusts the font size for better readability */
+        }
     </style>
 </head>
+
 <body>
     <h1>Undocumented Nostr Kinds</h1>
     <h2>List of Kinds Not Described by any NIPs</h2>
@@ -83,11 +106,19 @@
             </thead>
             <tbody>
                 {{#each stats}}
-                <tr>
-                    <td>{{this.[0]}}</td>
-                    <td><a href="https://njump.me/{{this.[1].event_id}}" target="_blank">{{this.[1].event_id}}</a></td>
+                <tr class="row-toggle" data-event-json='{{json this.[1].event}}'>
+                    <td> <a href="https://github.com/search?q=repo%3Anostr-protocol%2Fnips++%2Fkind.*%5Cb{{this.[0]}}%5Cb%2F&type=code">{{this.[0]}}</a>
+                    </td>
+                    <td>
+                        <span class="toggle-indicator">▼</span>
+                        <a href="#" class="event-link">{{this.[1].event.id}}</a>
+
+                    </td>
                     <td>{{this.[1].count}}</td>
                     <td>{{date this.[1].last_updated}}</td>
+                </tr>
+                <tr class="json-display-row" style="display: none;">
+                    <td colspan="4" class="json-content"></td>
                 </tr>
                 {{/each}}
             </tbody>
@@ -96,5 +127,30 @@
     <div class="footer">
         <p>Data provided by Nostr network analysis.</p>
     </div>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            document.querySelectorAll('.row-toggle').forEach((element) => {
+                const link = element.querySelector('.event-link');
+                link.addEventListener('click', (event) => {
+                    event.preventDefault();
+                    const jsonData = element.getAttribute('data-event-json');
+                    const jsonDisplayRow = element.nextElementSibling;
+                    const jsonContentCell = jsonDisplayRow.querySelector('.json-content');
+                    const toggleIndicator = element.querySelector('.toggle-indicator');
+
+                    if (jsonDisplayRow.style.display === 'none') {
+                        jsonContentCell.innerHTML = `<pre><code class="json">${jsonData}</code></pre>`;
+                        hljs.highlightElement(jsonContentCell.querySelector('code'));
+                        jsonDisplayRow.style.display = '';
+                        toggleIndicator.textContent = '▲';
+                    } else {
+                        jsonDisplayRow.style.display = 'none';
+                        toggleIndicator.textContent = '▼';
+                    }
+                });
+            });
+        });
+    </script>
 </body>
+
 </html>

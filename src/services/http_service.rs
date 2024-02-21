@@ -10,9 +10,14 @@ use axum::{
     Router,
 };
 use chrono::NaiveDateTime;
-use handlebars::{Context, Handlebars, Helper, Output, RenderContext, RenderError};
+use handlebars::{
+    Context, Handlebars, Helper, Output, RenderContext, RenderError, RenderErrorReason,
+};
+use lazy_static::lazy_static;
+use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,6 +26,11 @@ use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::{error, info};
+
+lazy_static! {
+    static ref STATS_FILE: String =
+        env::var("STATS_FILE").unwrap_or_else(|_| "/var/data/stats.json".to_string());
+}
 
 pub struct HttpService {
     cancellation_token: CancellationToken,
@@ -35,6 +45,7 @@ impl HttpService {
     pub fn new(cancellation_token: CancellationToken) -> Self {
         let mut hb = Handlebars::new();
         hb.register_helper("date", Box::new(date_helper));
+        hb.register_helper("json", Box::new(json_helper));
         if let Err(e) = hb.register_template_file("stats", "templates/stats.hbs") {
             error!("Failed to load template: {}", e);
         }
@@ -94,7 +105,7 @@ fn shutdown(cancellation_token: CancellationToken) -> impl Future<Output = ()> {
 
 #[derive(Serialize, Deserialize)]
 struct Stat {
-    event_id: String,
+    event: Event,
     count: u64,
     last_updated: u64, // Assuming UNIX timestamp for simplicity
 }
@@ -104,7 +115,7 @@ async fn fetch_stats(
     _: HeaderMap,
     State(AppState { hb, .. }): State<AppState>,
 ) -> impl IntoResponse {
-    match read_to_string("/var/data/stats.json").await {
+    match read_to_string(&*STATS_FILE).await {
         Ok(content) => {
             let stats: HashMap<String, Stat> = serde_json::from_str(&content).unwrap_or_default();
             let mut stats_vec: Vec<(String, Stat)> = stats.into_iter().collect();
@@ -153,4 +164,25 @@ fn date_helper(
             Ok(())
         }
     }
+}
+
+fn json_helper(
+    h: &Helper,
+    _: &Handlebars,
+    _: &Context,
+    _: &mut RenderContext,
+    out: &mut dyn Output,
+) -> Result<(), RenderError> {
+    // Attempt to get the parameter passed to the helper
+    let param = h
+        .param(0)
+        .ok_or(RenderErrorReason::ParamNotFoundForIndex("json", 0))?;
+
+    // Serialize the parameter to a JSON string
+    let serialized = serde_json::to_string_pretty(param.value())
+        .map_err(|_e| RenderErrorReason::InvalidJsonPath("json".to_string()))?;
+
+    // Write the JSON string to the template output
+    out.write(&serialized)?;
+    Ok(())
 }

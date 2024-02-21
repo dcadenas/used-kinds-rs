@@ -10,8 +10,10 @@ anyhow = "1.0.79"
 axum = "0.7.4"
 chrono = { version = "0.4.34", features = ["serde"] }
 config = "0.13.4"
+console-subscriber = "0.2.0"
 env_logger = "0.11.1"
 handlebars = "5.1.0"
+lazy_static = "1.4.0"
 log = "0.4.20"
 nostr-sdk = "0.28.0"
 serde = { version = "1.0.196", features = ["derive"] }
