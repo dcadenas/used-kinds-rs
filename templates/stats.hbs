@@ -5,6 +5,7 @@
     <link rel="stylesheet"
         href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-light.min.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css">
+
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 
 
@@ -95,6 +96,14 @@
         .toggle-indicator {
             cursor: pointer;
         }
+
+        th {
+            cursor: pointer;
+        }
+
+        .sort-indicator {
+            margin-left: 5px;
+        }
     </style>
 </head>
 
@@ -110,10 +119,10 @@
         <table>
             <thead>
                 <tr>
-                    <th>Kind</th>
-                    <th>Latest Event Sampled</th>
-                    <th>Seen Times</th>
-                    <th>Last Seen At</th>
+                    <th>Kind <span class="sort-indicator"></span></th>
+                    <th>Latest Event Sampled <span class="sort-indicator"></span></th>
+                    <th>Seen Times <span class="sort-indicator"></span></th>
+                    <th>Last Seen At <span class="sort-indicator"></span></th>
                 </tr>
             </thead>
             <tbody>
@@ -144,7 +153,32 @@
     </div>
 
     <script>
+
         document.addEventListener('DOMContentLoaded', () => {
+            const getCellValue = (tr, idx) => tr.children[idx] ? tr.children[idx].innerText || tr.children[idx].textContent : '';
+            const comparer = (idx, asc) => (a, b) => ((v1, v2) =>
+                v1 !== '' && v2 !== '' && !isNaN(v1) && !isNaN(v2) ? v1 - v2 : v1.toString().localeCompare(v2)
+            )(getCellValue(asc ? a : b, idx), getCellValue(asc ? b : a, idx));
+
+            document.querySelectorAll('th').forEach(th => {
+                let indicator = th.querySelector('.sort-indicator');
+                th.addEventListener('click', function () {
+                    const table = th.closest('table');
+                    const tbody = table.querySelector('tbody');
+                    Array.from(tbody.querySelectorAll('tr'))
+                        .sort(comparer(Array.from(th.parentNode.children).indexOf(th), this.asc = !this.asc))
+                        .forEach(tr => tbody.appendChild(tr));
+
+                    // Clear existing indicators
+                    document.querySelectorAll('.sort-indicator').forEach(indicator => {
+                        indicator.textContent = '';
+                    });
+
+                    // Set the current sort indicator
+                    indicator.textContent = this.asc ? '↑' : '↓';
+                });
+            });
+
             document.querySelectorAll('.row-toggle').forEach((element) => {
                 const link = element.querySelector('.event-link');
                 link.addEventListener('click', (event) => {
