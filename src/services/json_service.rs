@@ -106,6 +106,7 @@ impl JsonService {
                             let mut kind_stats = self.kind_stats.lock().await;
                             kind_stats.entry(new_kind_event.kind.as_u32())
                             .and_modify(|e| {
+                                e.event = new_kind_event.clone();
                                 e.count += 1;
                                 e.last_updated = Utc::now();
                             })

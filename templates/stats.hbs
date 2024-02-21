@@ -2,11 +2,13 @@
 <html>
 
 <head>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/default.min.css">
+    <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-light.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 
 
-    <title>Undocumented Nostr Kinds</title>
+    <title>Tracker for Undocumented Nostr Event Kinds</title>
     <style>
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -38,7 +40,7 @@
         }
 
         th {
-            background-color: #007bff;
+            background-color: #4a86e8;
             color: #ffffff;
             text-transform: uppercase;
         }
@@ -70,36 +72,46 @@
             body {
                 margin: 20px;
             }
+
+            th,
+            td {
+                padding: 8px 10px;
+                /* Adjust table padding on smaller screens */
+            }
         }
 
         .json-content {
             max-height: 400px;
-            /* Adjust based on your needs */
             overflow: auto;
-            /* Allows scrolling */
             white-space: pre-wrap;
-            /* Keeps formatting */
             background-color: #f9f9f9;
             border: 1px solid #ddd;
             padding: 10px;
             border-radius: 5px;
             word-wrap: break-word;
-            font-size: 0.9em;
-            /* Optional: Adjusts the font size for better readability */
+            font-size: 0.85em;
+        }
+
+        .toggle-indicator {
+            cursor: pointer;
         }
     </style>
 </head>
 
 <body>
-    <h1>Undocumented Nostr Kinds</h1>
-    <h2>List of Kinds Not Described by any NIPs</h2>
-    <p>Note: Kinds not seen for a month are removed from the list.</p>
+    <h1>Tracker for Undocumented Nostr Event Kinds</h1>
+    <p>This service samples events from the Nostr network and keeps track of kinds that are not documented by any NIPs
+        (Nostr Improvement Proposals). This can be useful for developers or researchers aiming to add a new kind and
+        want to choose a number that
+        minimizes the chances of clashing with someone else exploring a new idea.</p>
+    <p><strong>Note:</strong> Kinds not seen for a month are removed from the list.</p>
+
     <div class="table-responsive">
         <table>
             <thead>
                 <tr>
                     <th>Kind</th>
-                    <th>Event ID</th>
+                    <th>Latest Event Sampled</th>
                     <th>Seen Times</th>
                     <th>Last Seen At</th>
                 </tr>
@@ -107,15 +119,16 @@
             <tbody>
                 {{#each stats}}
                 <tr class="row-toggle" data-event-json='{{json this.[1].event}}'>
-                    <td> <a href="https://github.com/search?q=repo%3Anostr-protocol%2Fnips++%2Fkind.*%5Cb{{this.[0]}}%5Cb%2F&type=code">{{this.[0]}}</a>
+                    <td> <a
+                            href="https://github.com/search?q=repo%3Anostr-protocol%2Fnips++%2Fkind.*%5Cb{{this.[0]}}%5Cb%2F&type=code">{{this.[0]}}</a>
                     </td>
                     <td>
-                        <span class="toggle-indicator">▼</span>
+                        <span class="toggle-indicator"><i class="fas fa-chevron-down"></i></span>
                         <a href="#" class="event-link">{{this.[1].event.id}}</a>
 
                     </td>
                     <td>{{this.[1].count}}</td>
-                    <td>{{date this.[1].last_updated}}</td>
+                    <td>{{date_relative this.[1].last_updated}}</td>
                 </tr>
                 <tr class="json-display-row" style="display: none;">
                     <td colspan="4" class="json-content"></td>
@@ -125,8 +138,11 @@
         </table>
     </div>
     <div class="footer">
-        <p>Data provided by Nostr network analysis.</p>
+        <p>For feedback or inquiries, feel free to reach out at Nostr:</p>
+        <p><a href="nop: daniel@nos.social" style="color: #007bff; text-decoration: none;"><i
+                    class="fas fa-paper-plane"></i> daniel@nos.social</a></p>
     </div>
+
     <script>
         document.addEventListener('DOMContentLoaded', () => {
             document.querySelectorAll('.row-toggle').forEach((element) => {
@@ -136,16 +152,16 @@
                     const jsonData = element.getAttribute('data-event-json');
                     const jsonDisplayRow = element.nextElementSibling;
                     const jsonContentCell = jsonDisplayRow.querySelector('.json-content');
-                    const toggleIndicator = element.querySelector('.toggle-indicator');
+                    const toggleIndicator = element.querySelector('.fas');
 
                     if (jsonDisplayRow.style.display === 'none') {
                         jsonContentCell.innerHTML = `<pre><code class="json">${jsonData}</code></pre>`;
                         hljs.highlightElement(jsonContentCell.querySelector('code'));
                         jsonDisplayRow.style.display = '';
-                        toggleIndicator.textContent = '▲';
+                        toggleIndicator.className = 'fas fa-chevron-up';
                     } else {
                         jsonDisplayRow.style.display = 'none';
-                        toggleIndicator.textContent = '▼';
+                        toggleIndicator.className = 'fas fa-chevron-down';
                     }
                 });
             });

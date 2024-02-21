@@ -9,7 +9,7 @@ use axum::{
     routing::get,
     Router,
 };
-use chrono::NaiveDateTime;
+use chrono::{NaiveDateTime, Utc};
 use handlebars::{
     Context, Handlebars, Helper, Output, RenderContext, RenderError, RenderErrorReason,
 };
@@ -44,7 +44,7 @@ struct AppState {
 impl HttpService {
     pub fn new(cancellation_token: CancellationToken) -> Self {
         let mut hb = Handlebars::new();
-        hb.register_helper("date", Box::new(date_helper));
+        hb.register_helper("date_relative", Box::new(date_relative));
         hb.register_helper("json", Box::new(json_helper));
         if let Err(e) = hb.register_template_file("stats", "templates/stats.hbs") {
             error!("Failed to load template: {}", e);
@@ -117,7 +117,10 @@ async fn fetch_stats(
 ) -> impl IntoResponse {
     match read_to_string(&*STATS_FILE).await {
         Ok(content) => {
-            let stats: HashMap<String, Stat> = serde_json::from_str(&content).unwrap_or_default();
+            let stats: HashMap<String, Stat> = serde_json::from_str(&content).unwrap_or_else(|e| {
+                error!("Failed to parse stats file, defaulting to empty: {}", e);
+                HashMap::default()
+            });
             let mut stats_vec: Vec<(String, Stat)> = stats.into_iter().collect();
             stats_vec.sort_by_key(|(kind, _)| kind.parse::<u32>().unwrap_or(0));
 
@@ -145,7 +148,7 @@ async fn fetch_stats(
     }
 }
 
-fn date_helper(
+fn date_relative(
     h: &Helper,
     _: &Handlebars,
     _: &Context,
@@ -153,17 +156,31 @@ fn date_helper(
     out: &mut dyn Output,
 ) -> Result<(), RenderError> {
     let timestamp = h.param(0).unwrap().value().as_u64().unwrap();
-    match NaiveDateTime::from_timestamp_opt(timestamp as i64, 0) {
+
+    let dt = NaiveDateTime::from_timestamp_opt(timestamp as i64, 0);
+    let ago = match dt {
         Some(dt) => {
-            out.write(&dt.format("%Y-%m-%d %H:%M:%S").to_string())?;
-            Ok(())
+            let now = Utc::now().naive_utc();
+            let duration = now.signed_duration_since(dt);
+            if duration.num_seconds() < 60 {
+                "just now".to_string()
+            } else if duration.num_minutes() < 60 {
+                let mins = duration.num_minutes();
+                format!("{} minute{} ago", mins, if mins == 1 { "" } else { "s" })
+            } else if duration.num_hours() < 24 {
+                let hours = duration.num_hours();
+                format!("{} hour{} ago", hours, if hours == 1 { "" } else { "s" })
+            } else {
+                let days = duration.num_days();
+                format!("{} day{} ago", days, if days == 1 { "" } else { "s" })
+            }
         }
-        None => {
-            tracing::error!("Invalid timestamp encountered: {}", timestamp);
-            out.write("Invalid timestamp")?;
-            Ok(())
-        }
-    }
+        None => "Invalid timestamp".to_string(),
+    };
+
+    out.write(&ago)?;
+
+    Ok(())
 }
 
 fn json_helper(
