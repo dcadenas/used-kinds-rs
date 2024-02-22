@@ -8,7 +8,6 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.79"
 axum = "0.7.4"
-cached = "0.48.1"
 chrono = { version = "0.4.34", features = ["serde"] }
 config = "0.13.4"
 console-subscriber = "0.2.0"

@@ -20,6 +20,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::fs::read_to_string as async_read_to_string;
+use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
@@ -37,8 +38,8 @@ pub struct HttpService {
 #[derive(Clone)]
 struct AppState {
     hb: Arc<Handlebars<'static>>,
-    last_file_load: Option<DateTime<Utc>>,
-    data: Arc<HashMap<String, Stat>>,
+    last_file_load: Arc<RwLock<Option<DateTime<Utc>>>>,
+    data: Arc<RwLock<Vec<(String, Stat)>>>,
 }
 
 impl AppState {
@@ -53,22 +54,24 @@ impl AppState {
 
         AppState {
             hb: Arc::new(hb),
-            last_file_load: None,
-            data: Arc::new(HashMap::new()),
+            last_file_load: Arc::new(RwLock::new(None)),
+            data: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
     async fn maybe_load_data(&mut self) -> Result<(), anyhow::Error> {
         let refresh_interval = 60;
+        let last_file_load = self.last_file_load.read().await.clone();
 
-        let should_refresh = if self.last_file_load.is_none() {
-            self.last_file_load = Some(Utc::now());
+        let should_refresh = if last_file_load.is_none() {
             true
         } else {
-            self.last_file_load
-                .unwrap()
-                .checked_add_signed(chrono::Duration::seconds(refresh_interval))
-                .map_or(true, |next_check| next_check < Utc::now())
+            let asdf = last_file_load.unwrap() + chrono::Duration::seconds(refresh_interval);
+            if asdf < Utc::now() {
+                true
+            } else {
+                false
+            }
         };
 
         if should_refresh {
@@ -79,18 +82,27 @@ impl AppState {
                             error!("Failed to parse stats file, defaulting to empty: {}", e);
                             HashMap::default()
                         });
-                    self.data = Arc::new(data);
-                    self.last_file_load = Some(Utc::now());
+
+                    let mut data_as_sorted_vec: Vec<(String, Stat)> = data.into_iter().collect();
+                    data_as_sorted_vec.sort_by_key(|(kind, _)| kind.parse::<u32>().unwrap_or(0));
+
+                    {
+                        let mut stats_vec = self.data.write().await;
+                        *stats_vec = data_as_sorted_vec;
+                    }
+
+                    let mut last_file_load = self.last_file_load.write().await;
+                    *last_file_load = Some(Utc::now());
+
                     info!(
                         "Cache refreshed at {}",
-                        self.last_file_load.unwrap().format("%Y-%m-%d %H:%M:%S")
+                        last_file_load.unwrap().format("%Y-%m-%d %H:%M:%S")
                     );
                 }
                 Err(e) => error!("Failed to read stats file: {}", e),
             }
         } else {
-            let next_check =
-                self.last_file_load.unwrap() + chrono::Duration::seconds(refresh_interval);
+            let next_check = last_file_load.unwrap() + chrono::Duration::seconds(refresh_interval);
             info!(
                 "Using cached data until {}",
                 next_check.format("%Y-%m-%d %H:%M:%S")
@@ -169,12 +181,7 @@ async fn fetch_stats(
         .await
         .unwrap_or_else(|e| error!("Error loading data: {}", e));
 
-    let stats = Arc::try_unwrap(app_state.data).unwrap_or_else(|arc| (*arc).clone()); // Clone the HashMap if there are multiple owners
-
-    let mut stats_vec: Vec<(String, Stat)> = stats.into_iter().collect();
-    stats_vec.sort_by_key(|(kind, _)| kind.parse::<u32>().unwrap_or(0));
-
-    // Directly prepare the sorted vector for the template, no need to convert back to HashMap
+    let stats_vec: Vec<(String, Stat)> = app_state.data.read().await.clone();
     let data = serde_json::json!({ "stats": stats_vec });
 
     match app_state.hb.render("stats", &data) {
