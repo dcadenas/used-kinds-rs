@@ -143,17 +143,13 @@
                     <td> <a
                             href="https://github.com/search?q=repo%3Anostr-protocol%2Fnips++%2Fkind.*%5Cb{{this.[0]}}%5Cb%2F&type=code">{{this.[0]}}</a>
                     </td>
-                    <td>
-                        <span class="toggle-indicator"><i class="fas fa-chevron-down"></i></span>
+                    <td class="toggle-indicator">
+                        <span><i class="fas fa-chevron-down"></i></span>
                         <a href="#" class="event-link">{{this.[1].event.id}}</a>
-
                     </td>
                     <td>{{this.[1].count}}</td>
                     <td>{{date_relative this.[1].last_updated}}</td>
                     <td class="hidden">{{this.[1].last_updated }}</td>
-                </tr>
-                <tr class="json-display-row" style="display: none;">
-                    <td colspan="4" class="json-content"></td>
                 </tr>
                 {{/each}}
             </tbody>
@@ -167,6 +163,7 @@
 
     <script>
 
+
         document.addEventListener('DOMContentLoaded', () => {
             const getCellValue = (tr, idx) => tr.children[idx] ? tr.children[idx].innerText || tr.children[idx].textContent : '';
             const comparer = (idx, asc) => (a, b) => ((v1, v2) =>
@@ -178,10 +175,15 @@
                 th.addEventListener('click', function () {
                     const table = th.closest('table');
                     const tbody = table.querySelector('tbody');
+
+
+                    const jsonRows = tbody.querySelectorAll('.json-display-row');
+                    jsonRows.forEach(row => {
+                        row.remove();
+                    });
+
                     let index = Array.from(th.parentNode.children).indexOf(th);
 
-                    // For now we just hardcode that if we select the human readable column we are
-                    // in fact sorting through the column that contains the timestamp number
                     if (index === 3) {
                         index = 4;
                     }
@@ -190,36 +192,41 @@
                         .sort(comparer(index, this.asc = !this.asc))
                         .forEach(tr => tbody.appendChild(tr));
 
-                    // Clear existing indicators
                     document.querySelectorAll('.sort-indicator').forEach(indicator => {
                         indicator.textContent = '';
                     });
 
-                    // Set the current sort indicator
                     indicator.textContent = this.asc ? '↑' : '↓';
                 });
             });
+            document.querySelectorAll('pre code').forEach((block) => {
+                hljs.highlightElement(block);
+            });
 
-            document.querySelectorAll('.row-toggle').forEach((element) => {
-                const link = element.querySelector('.event-link');
-                link.addEventListener('click', (event) => {
-                    event.preventDefault();
-                    const jsonData = element.getAttribute('data-event-json');
-                    const jsonDisplayRow = element.nextElementSibling;
-                    const jsonContentCell = jsonDisplayRow.querySelector('.json-content');
-                    const toggleIndicator = element.querySelector('.fas');
+            document.querySelectorAll('.row-toggle .toggle-indicator').forEach(toggle => {
+                toggle.addEventListener('click', (event) => {
+                    event.stopPropagation();
+                    const row = toggle.closest('.row-toggle');
+                    let nextRow = row.nextElementSibling;
+                    const jsonData = row.getAttribute('data-event-json');
 
-                    if (jsonDisplayRow.style.display === 'none') {
-                        jsonContentCell.innerHTML = `<pre><code class="json">${jsonData}</code></pre>`;
-                        hljs.highlightElement(jsonContentCell.querySelector('code'));
-                        jsonDisplayRow.style.display = '';
-                        toggleIndicator.className = 'fas fa-chevron-up';
+                    if (nextRow && nextRow.classList.contains('json-display-row')) {
+                        nextRow.style.display = nextRow.style.display === 'none' ? '' : 'none';
                     } else {
-                        jsonDisplayRow.style.display = 'none';
-                        toggleIndicator.className = 'fas fa-chevron-down';
+                        const detailRow = document.createElement('tr');
+                        detailRow.className = 'json-display-row';
+                        const detailCell = document.createElement('td');
+                        detailCell.colSpan = 5;
+                        detailCell.classList.add('json-content');
+                        detailCell.innerHTML = `<pre><code class="json">${jsonData}</code></pre>`;
+                        detailRow.appendChild(detailCell);
+                        row.parentNode.insertBefore(detailRow, nextRow);
+
+                        hljs.highlightElement(detailCell.querySelector('code'));
                     }
                 });
             });
+
         });
     </script>
 </body>
