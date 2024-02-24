@@ -132,27 +132,20 @@ impl HttpService {
         let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let token_clone = self.cancellation_token.clone();
+        let server =
+            async { axum::serve(listener, router).with_graceful_shutdown(shutdown(token_clone)) };
 
-        let task = tokio::spawn(async move {
-            match axum::serve(listener, router)
-                .with_graceful_shutdown(shutdown(token_clone))
-                .await
-            {
-                Ok(_) => info!("HTTP server finished"),
-                Err(e) => info!("HTTP server finished with error: {}", e),
-            }
-        });
-
-        self.cancellation_token.cancelled().await;
-        sleep(Duration::from_secs(1)).await;
-
-        if !task.is_finished() {
-            info!("Forcefully shutting down the HTTP server in 5 seconds");
+        let force_shutdown = async {
+            self.cancellation_token.cancelled().await;
             sleep(Duration::from_secs(5)).await;
-            task.abort();
-        }
-        info!("HTTP service exited");
+        };
 
+        tokio::select! {
+            _ = server => info!("HTTP service exited"),
+            _ = force_shutdown => info!("HTTP service exited due to force shutdown"),
+        }
+
+        info!("HTTP service exited");
         Ok(())
     }
 }

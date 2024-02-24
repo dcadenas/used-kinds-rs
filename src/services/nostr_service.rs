@@ -49,48 +49,53 @@ impl NostrService {
         Ok(())
     }
 
-    async fn periodically_check_for_new_kinds(&self, client: &Client) -> Result<()> {
-        let duration = Duration::from_secs(60 * 5);
+    async fn get_events(&self, client: &Client) {
         let amount = 1000;
 
+        let duration = Duration::from_secs(60 * 5);
+
+        let since = Timestamp::now() - duration;
+        let filters = vec![Filter::new().limit(amount).since(since)];
+
+        match client
+            .get_events_of_with_opts(
+                filters,
+                Some(Duration::from_secs(60)),
+                FilterOptions::WaitDurationAfterEOSE(Duration::from_secs(10)),
+            )
+            .await
+        {
+            Ok(events) => {
+                for event in events {
+                    if is_kind_free(event.kind.as_u32()) {
+                        debug!("Received a new kind event: {:?}", event);
+                        info!("Received a new event of kind {}", event.kind);
+                        // TODO: How can I know where was this event found? FTM it's hardcoded
+                        let relay_url = Url::parse("wss://relay.damus.io").unwrap();
+                        if let Err(e) = self.new_kind_event_tx.send((event, relay_url)) {
+                            error!("Failed to send the new kind event: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => error!("Failed to get events: {}", e),
+        }
+    }
+
+    async fn periodically_check_for_new_kinds(&self, client: &Client) -> Result<()> {
+        let duration = Duration::from_secs(60 * 5);
         let mut interval = tokio::time::interval(duration);
 
         loop {
+            interval.tick().await;
+            info!("Checking for new kind events...");
+
             tokio::select! {
                 _ = self.cancellation_token.cancelled() => {
                     info!("Cancellation token received, stopping the check for new kind events");
                     break;
                 },
-                _ = interval.tick() => {
-                    info!("Checking for new kind events...");
-
-                    let since = Timestamp::now() - duration;
-                    let filters = vec![Filter::new().limit(amount).since(since)];
-
-                    match client
-                        .get_events_of_with_opts(
-                            filters,
-                            Some(Duration::from_secs(60)),
-                            FilterOptions::WaitDurationAfterEOSE(Duration::from_secs(10)),
-                        )
-                        .await
-                    {
-                        Ok(events) => {
-                            for event in events {
-                                if is_kind_free(event.kind.as_u32()) {
-                                    debug!("Received a new kind event: {:?}", event);
-                                    info!("Received a new event of kind {}", event.kind);
-                                    // TODO: How can I know where was this event found? FTM it's hardcoded
-                                    let relay_url = Url::parse("wss://relay.damus.io").unwrap();
-                                    if let Err(e) = self.new_kind_event_tx.send((event, relay_url)) {
-                                        error!("Failed to send the new kind event: {}", e);
-                                    }
-                                }
-                            }
-                        },
-                        Err(e) => error!("Failed to get events: {}", e)
-                    }
-                }
+                _ = self.get_events(client) => {}
             }
         }
 
