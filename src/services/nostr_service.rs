@@ -95,6 +95,7 @@ impl NostrService {
                     info!("Cancellation token received, stopping the check for new kind events");
                     break;
                 },
+                // It's a shame that get_events doesn't support cancellation. TODO: contribute to nostr-sdk
                 _ = self.get_events(client) => {}
             }
         }

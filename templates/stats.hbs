@@ -199,6 +199,7 @@
                     indicator.textContent = this.asc ? '↑' : '↓';
                 });
             });
+
             document.querySelectorAll('pre code').forEach((block) => {
                 hljs.highlightElement(block);
             });
@@ -208,7 +209,7 @@
                     event.stopPropagation();
                     const row = toggle.closest('.row-toggle');
                     let nextRow = row.nextElementSibling;
-                    const jsonData = row.getAttribute('data-event-json');
+                    const jsonData = atob(row.getAttribute('data-event-json'));
 
                     if (nextRow && nextRow.classList.contains('json-display-row')) {
                         nextRow.style.display = nextRow.style.display === 'none' ? '' : 'none';
@@ -218,7 +219,14 @@
                         const detailCell = document.createElement('td');
                         detailCell.colSpan = 5;
                         detailCell.classList.add('json-content');
-                        detailCell.innerHTML = `<pre><code class="json">${jsonData}</code></pre>`;
+                        const pre = document.createElement('pre');
+                        const code = document.createElement('code');
+                        code.className = 'json';
+                        code.textContent = jsonData; // Safely assigns text, escaping HTML and JS
+
+                        pre.appendChild(code);
+                        detailCell.appendChild(pre);
+
                         detailRow.appendChild(detailCell);
                         row.parentNode.insertBefore(detailRow, nextRow);
 

@@ -1,3 +1,5 @@
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
+
 use anyhow::Result;
 use axum::{
     extract::State,
@@ -132,8 +134,11 @@ impl HttpService {
         let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let token_clone = self.cancellation_token.clone();
-        let server =
-            async { axum::serve(listener, router).with_graceful_shutdown(shutdown(token_clone)) };
+        let server = async {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown(token_clone))
+                .await
+        };
 
         let force_shutdown = async {
             self.cancellation_token.cancelled().await;
@@ -231,16 +236,15 @@ fn json_helper(
     _: &mut RenderContext,
     out: &mut dyn Output,
 ) -> Result<(), RenderError> {
-    // Attempt to get the parameter passed to the helper
     let param = h
         .param(0)
         .ok_or(RenderErrorReason::ParamNotFoundForIndex("json", 0))?;
 
-    // Serialize the parameter to a JSON string
     let serialized = serde_json::to_string_pretty(param.value())
         .map_err(|_e| RenderErrorReason::InvalidJsonPath("json".to_string()))?;
 
-    // Write the JSON string to the template output
-    out.write(&serialized)?;
+    let encoded = URL_SAFE.encode(&serialized);
+
+    out.write(&encoded)?;
     Ok(())
 }
