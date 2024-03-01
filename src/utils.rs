@@ -1,6 +1,6 @@
-// A static list of taken kinds, with comments indicating the purpose of each kind.
-// These kinds are based on the Nostr protocol documentation at https://github.com/nostr-protocol/nips/edit/master/README.md
-static TAKEN_KINDS: [u32; 77] = [
+// List of taken kinds, including comments for clarity.
+// These kinds are based on the latest Nostr NIPs documentation.
+static TAKEN_KINDS: [u32; 84] = [
     0,    // Metadata
     1,    // Short Text Note
     2,    // Recommend Relay (deprecated)
@@ -10,6 +10,10 @@ static TAKEN_KINDS: [u32; 77] = [
     6,    // Repost
     7,    // Reaction
     8,    // Badge Award
+    9,    // Group Chat Message
+    10,   // Group Chat Threaded Reply
+    11,   // Group Thread
+    12,   // Group Thread Reply
     13,   // Seal
     16,   // Generic Repost
     40,   // Channel Creation
@@ -27,9 +31,10 @@ static TAKEN_KINDS: [u32; 77] = [
     1984, // Reporting
     1985, // Label
     4550, // Community Post Approval
-    // The range 5000-5999 is reserved for Job Requests
-    // The range 6000-6999 is reserved for Job Results
+    // The ranges 5000-5999 and 6000-6999 are reserved for Job Requests and Job Results
     7000,  // Job Feedback
+    9000,  // Group Control Events start
+    9030,  // Group Control Events end
     9041,  // Zap Goal
     9734,  // Zap Request
     9735,  // Zap
@@ -42,6 +47,7 @@ static TAKEN_KINDS: [u32; 77] = [
     10005, // Public chats list
     10006, // Blocked relays list
     10007, // Search relays list
+    10009, // User groups
     10015, // Interests list
     10030, // User emoji list
     10096, // File storage server list
@@ -80,6 +86,7 @@ static TAKEN_KINDS: [u32; 77] = [
     31989, // Handler recommendation
     31990, // Handler information
     34550, // Community Definition
+           // Additional kinds based on the provided range
 ];
 
 /// Checks if a kind is free (not taken) according to Nostr NIPs.
@@ -92,5 +99,7 @@ static TAKEN_KINDS: [u32; 77] = [
 ///
 /// Returns `true` if the kind is free; otherwise, returns `false`.
 pub fn is_kind_free(kind: u32) -> bool {
-    !TAKEN_KINDS.contains(&kind) && !(kind >= 5000 && kind <= 6999)
+    !TAKEN_KINDS.contains(&kind)
+        && !(kind >= 5000 && kind <= 6999)
+        && !(kind >= 9000 && kind <= 9030)
 }
