@@ -61,7 +61,7 @@ impl AppState {
         }
     }
 
-    async fn maybe_load_data(&mut self) -> Result<(), anyhow::Error> {
+    async fn maybe_refresh_data(&mut self) -> Result<(), anyhow::Error> {
         let refresh_interval = 60;
         let last_file_load = self.last_file_load.read().await.clone();
 
@@ -175,7 +175,7 @@ async fn fetch_stats(
     State(mut app_state): State<AppState>,
 ) -> impl IntoResponse {
     app_state
-        .maybe_load_data()
+        .maybe_refresh_data()
         .await
         .unwrap_or_else(|e| error!("Error loading data: {}", e));
 
