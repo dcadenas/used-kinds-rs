@@ -1,9 +1,8 @@
+use crate::services::json_service::JsonActorMessage;
 use crate::utils::is_kind_free;
 use anyhow::Result;
 use nostr_sdk::prelude::*;
-use tokio::sync::broadcast::Sender;
-use tokio::time::Duration;
-use tokio_util::sync::CancellationToken;
+use ractor::{cast, concurrency::Duration, Actor, ActorProcessingErr, ActorRef};
 use tracing::{debug, error, info};
 
 const POPULAR_RELAYS: [&str; 4] = [
@@ -12,22 +11,69 @@ const POPULAR_RELAYS: [&str; 4] = [
     "wss://relayable.org",
     "wss://relay.n057r.club",
 ];
-pub struct NostrService {
-    cancellation_token: CancellationToken,
-    new_kind_event_tx: Sender<(Event, Url)>,
+
+pub struct NostrActor;
+pub struct State {
+    json_actor: ActorRef<JsonActorMessage>,
+    client: Client,
 }
-impl NostrService {
-    pub fn new(
-        cancellation_token: CancellationToken,
-        new_kind_event_tx: Sender<(Event, Url)>,
-    ) -> Self {
-        NostrService {
-            cancellation_token,
-            new_kind_event_tx,
+
+impl State {
+    async fn get_events(&self) {
+        let amount = 1000;
+
+        let duration = Duration::from_secs(60 * 5);
+
+        let since = Timestamp::now() - duration;
+        let filters = vec![Filter::new().limit(amount).since(since)];
+
+        match self
+            .client
+            .get_events_of_with_opts(
+                filters,
+                Some(Duration::from_secs(60)),
+                FilterOptions::WaitDurationAfterEOSE(Duration::from_secs(10)),
+            )
+            .await
+        {
+            Ok(events) => {
+                for event in events {
+                    if is_kind_free(event.kind.as_u32()) {
+                        debug!("Received a new kind event: {:?}", event);
+                        info!("Received a new event of kind {}", event.kind);
+                        // TODO: How can I know where was this event found? FTM it's hardcoded
+                        let relay_url = Url::parse("wss://relay.damus.io").unwrap();
+                        if let Err(e) = cast!(
+                            self.json_actor,
+                            JsonActorMessage::RecordEvent(event, relay_url)
+                        ) {
+                            error!("Failed to send the new kind event: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => error!("Failed to get events: {}", e),
         }
     }
+}
 
-    pub async fn run(&self) -> Result<()> {
+#[derive(Debug, Clone)]
+pub enum NostrActorMessage {
+    GetEvents,
+    Stop,
+}
+
+#[ractor::async_trait]
+impl Actor for NostrActor {
+    type Msg = NostrActorMessage;
+    type State = State;
+    type Arguments = ActorRef<JsonActorMessage>;
+
+    async fn pre_start(
+        &self,
+        myself: ActorRef<Self::Msg>,
+        json_actor: ActorRef<JsonActorMessage>,
+    ) -> Result<Self::State, ActorProcessingErr> {
         let opts = Options::new()
             .wait_for_send(false)
             .connection_timeout(Some(Duration::from_secs(5)))
@@ -43,64 +89,45 @@ impl NostrService {
 
         client.connect().await;
 
-        self.periodically_check_for_new_kinds(&client).await?;
-        info!("Notification handler exited");
+        let duration = Duration::from_secs(60 * 5);
+        myself.send_interval(duration, || NostrActorMessage::GetEvents);
 
+        let state = State {
+            json_actor: json_actor,
+            client,
+        };
+
+        Ok(state)
+    }
+
+    async fn post_stop(
+        &self,
+        _: ActorRef<Self::Msg>,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        if let Err(e) = cast!(state.json_actor, JsonActorMessage::Stop) {
+            error!("Failed to send stop message to json actor: {}", e);
+        }
+
+        info!("Nostr service exited");
         Ok(())
     }
 
-    async fn get_events(&self, client: &Client) {
-        let amount = 1000;
-
-        let duration = Duration::from_secs(60 * 5);
-
-        let since = Timestamp::now() - duration;
-        let filters = vec![Filter::new().limit(amount).since(since)];
-
-        match client
-            .get_events_of_with_opts(
-                filters,
-                Some(Duration::from_secs(60)),
-                FilterOptions::WaitDurationAfterEOSE(Duration::from_secs(10)),
-            )
-            .await
-        {
-            Ok(events) => {
-                for event in events {
-                    if is_kind_free(event.kind.as_u32()) {
-                        debug!("Received a new kind event: {:?}", event);
-                        info!("Received a new event of kind {}", event.kind);
-                        // TODO: How can I know where was this event found? FTM it's hardcoded
-                        let relay_url = Url::parse("wss://relay.damus.io").unwrap();
-                        if let Err(e) = self.new_kind_event_tx.send((event, relay_url)) {
-                            error!("Failed to send the new kind event: {}", e);
-                        }
-                    }
-                }
+    async fn handle(
+        &self,
+        myself: ActorRef<Self::Msg>,
+        message: Self::Msg,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        match message {
+            NostrActorMessage::GetEvents => {
+                state.get_events().await;
+                Ok(())
             }
-            Err(e) => error!("Failed to get events: {}", e),
-        }
-    }
-
-    async fn periodically_check_for_new_kinds(&self, client: &Client) -> Result<()> {
-        let duration = Duration::from_secs(60 * 5);
-        let mut interval = tokio::time::interval(duration);
-
-        loop {
-            interval.tick().await;
-            info!("Checking for new kind events...");
-
-            tokio::select! {
-                _ = self.cancellation_token.cancelled() => {
-                    info!("Cancellation token received, stopping the check for new kind events");
-                    break;
-                },
-                // It's a shame that get_events doesn't support cancellation. TODO: contribute to nostr-sdk
-                _ = self.get_events(client) => {}
+            NostrActorMessage::Stop => {
+                myself.stop(None);
+                Ok(())
             }
         }
-
-        info!("Cancellation token received, stopping the check for new kind events");
-        Ok(())
     }
 }

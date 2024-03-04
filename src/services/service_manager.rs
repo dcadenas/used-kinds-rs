@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{Error, Result};
+use ractor::{Actor, ActorRef};
 use tokio::macros::support::Future;
 use tokio::signal;
 use tokio::task::JoinHandle;
@@ -17,6 +18,23 @@ impl ServiceManager {
             tracker: TaskTracker::new(),
             token: CancellationToken::new(),
         }
+    }
+
+    pub async fn spawn_actor<A: Actor>(
+        &self,
+        actor: A,
+        args: A::Arguments,
+    ) -> Result<ActorRef<A::Msg>, Error> {
+        let name = Some(
+            std::any::type_name::<A>()
+                .split("::")
+                .last()
+                .unwrap()
+                .to_string(),
+        );
+        let (json_actor, json_handle) = Actor::spawn(name, actor, args).await?;
+        self.tracker.spawn(json_handle);
+        Ok(json_actor)
     }
 
     pub fn spawn<F, Fut>(&self, task: F) -> JoinHandle<()>
