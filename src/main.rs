@@ -2,8 +2,7 @@ mod services;
 mod utils;
 
 use crate::services::http_service::HttpService;
-use crate::services::json_service::JsonActor;
-use crate::services::nostr_service::{NostrActor, NostrActorMessage};
+use crate::services::json_service::{JsonActor, JsonActorMessage};
 use crate::services::service_manager::ServiceManager;
 use anyhow::Result;
 use ractor::cast;
@@ -20,7 +19,6 @@ async fn main() -> Result<()> {
     let service_manager = ServiceManager::new();
 
     let json_actor = service_manager.spawn_actor(JsonActor, ()).await?;
-    let nostr_actor = service_manager.spawn_actor(NostrActor, json_actor).await?;
 
     service_manager.spawn(|cancellation_token| async move {
         let http_service = HttpService::new(cancellation_token);
@@ -31,7 +29,7 @@ async fn main() -> Result<()> {
             e
         })?;
 
-        cast!(nostr_actor, NostrActorMessage::Stop).map_err(|e| {
+        cast!(json_actor, JsonActorMessage::Stop).map_err(|e| {
             error!("Failed to stop json actor: {}", e);
             e
         })?;

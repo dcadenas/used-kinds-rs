@@ -1,9 +1,10 @@
+use crate::services::nostr_service::{NostrActor, NostrActorMessage};
 use crate::utils::is_kind_free;
 use anyhow::Result;
 use chrono::Utc;
 use lazy_static::lazy_static;
 use nostr_sdk::prelude::*;
-use ractor::{concurrency::Duration, Actor, ActorProcessingErr, ActorRef};
+use ractor::{concurrency::Duration, Actor, ActorProcessingErr, ActorRef, SupervisionEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -30,10 +31,15 @@ pub struct KindEntry {
     last_updated: i64,
 }
 
+pub struct State {
+    kind_stats: HashMap<u32, KindEntry>,
+    nostr_actor: ActorRef<NostrActorMessage>,
+}
+
 #[ractor::async_trait]
 impl Actor for JsonActor {
     type Msg = JsonActorMessage;
-    type State = HashMap<u32, KindEntry>;
+    type State = State;
     type Arguments = ();
 
     async fn pre_start(
@@ -48,20 +54,32 @@ impl Actor for JsonActor {
                 "{}".to_string()
             });
 
-        let mut state: HashMap<u32, KindEntry> =
-            serde_json::from_str(&json_str).unwrap_or_else(|e| {
+        let mut kind_stats: HashMap<u32, KindEntry> = serde_json::from_str(&json_str)
+            .unwrap_or_else(|e| {
                 error!("Failed to read stats file, defaulting to empty: {}", e);
                 HashMap::default()
             });
 
         // Remove any entries that are older than 1 month or for which is_kind_free is false
-        state.retain(|kind, entry| {
+        kind_stats.retain(|kind, entry| {
             let is_old =
                 entry.last_updated < (Utc::now() - chrono::Duration::days(30)).timestamp_millis();
             !is_old && is_kind_free(*kind)
         });
 
         myself.send_interval(Duration::from_secs(10), || JsonActorMessage::SaveState);
+        let (nostr_actor, _) = Actor::spawn_linked(
+            Some("NostrActor".to_string()),
+            NostrActor,
+            myself.clone(),
+            myself.into(),
+        )
+        .await?;
+
+        let state = State {
+            kind_stats,
+            nostr_actor,
+        };
 
         Ok(state)
     }
@@ -75,6 +93,28 @@ impl Actor for JsonActor {
         Ok(())
     }
 
+    async fn handle_supervisor_evt(
+        &self,
+        myself: ActorRef<Self::Msg>,
+        message: SupervisionEvent,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        match message {
+            SupervisionEvent::ActorPanicked(dead_actor, panic_msg)
+                if dead_actor.get_id() == state.nostr_actor.get_id() =>
+            {
+                tracing::info!("JsonActor: {dead_actor:?} panicked with '{panic_msg}'");
+
+                tracing::info!("JsonActor: Terminating json actor");
+                myself.stop(Some("JsonActor died".to_string()));
+            }
+            other => {
+                tracing::info!("JsonActor: received supervisor event '{other}'");
+            }
+        }
+        Ok(())
+    }
+
     async fn handle(
         &self,
         myself: ActorRef<Self::Msg>,
@@ -84,6 +124,7 @@ impl Actor for JsonActor {
         match message {
             JsonActorMessage::RecordEvent(event, _url) => {
                 state
+                    .kind_stats
                     .entry(event.kind.as_u32())
                     .and_modify(|e| {
                         e.event = event.clone();
@@ -97,7 +138,7 @@ impl Actor for JsonActor {
                     });
             }
             JsonActorMessage::SaveState => {
-                save_stats_to_json(state).await?;
+                save_stats_to_json(&state.kind_stats).await?;
             }
             JsonActorMessage::Stop => {
                 myself.stop(None);

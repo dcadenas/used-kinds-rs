@@ -60,7 +60,6 @@ impl State {
 #[derive(Debug, Clone)]
 pub enum NostrActorMessage {
     GetEvents,
-    Stop,
 }
 
 #[ractor::async_trait]
@@ -103,29 +102,21 @@ impl Actor for NostrActor {
     async fn post_stop(
         &self,
         _: ActorRef<Self::Msg>,
-        state: &mut Self::State,
+        _state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        if let Err(e) = cast!(state.json_actor, JsonActorMessage::Stop) {
-            error!("Failed to send stop message to json actor: {}", e);
-        }
-
         info!("Nostr service exited");
         Ok(())
     }
 
     async fn handle(
         &self,
-        myself: ActorRef<Self::Msg>,
+        _myself: ActorRef<Self::Msg>,
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
             NostrActorMessage::GetEvents => {
                 state.get_events().await;
-                Ok(())
-            }
-            NostrActorMessage::Stop => {
-                myself.stop(None);
                 Ok(())
             }
         }
