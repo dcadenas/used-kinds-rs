@@ -1,4 +1,4 @@
-use base64::{engine::general_purpose::URL_SAFE, Engine as _};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 use anyhow::Result;
 use axum::{
@@ -33,6 +33,8 @@ lazy_static! {
         env::var("STATS_FILE").unwrap_or_else(|_| "/var/data/stats.json".to_string());
 }
 
+// TODO: Currently pretty anemic to be an actor but can be refactored later
+// while learning the actor model and how it merges with an http axum server
 pub struct HttpActor;
 
 #[derive(Clone)]
@@ -200,7 +202,7 @@ fn json_helper(
     let serialized = serde_json::to_string_pretty(param.value())
         .map_err(|_e| RenderErrorReason::InvalidJsonPath("json".to_string()))?;
 
-    let encoded = URL_SAFE.encode(&serialized);
+    let encoded = STANDARD.encode(&serialized);
 
     out.write(&encoded)?;
     Ok(())
