@@ -3,25 +3,28 @@ use ractor::{Actor, ActorRef};
 use tokio::macros::support::Future;
 use tokio::signal;
 use tokio::task::JoinHandle;
+use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info};
 
-pub struct ServiceManager {
+pub struct ServiceManager<A: Actor> {
+    actors: Vec<ActorRef<A::Msg>>,
     tracker: TaskTracker,
     token: CancellationToken,
 }
 
-impl ServiceManager {
+impl<A: Actor> ServiceManager<A> {
     pub fn new() -> Self {
         Self {
+            actors: Vec::new(),
             tracker: TaskTracker::new(),
             token: CancellationToken::new(),
         }
     }
 
-    pub async fn spawn_actor<A: Actor>(
-        &self,
+    pub async fn spawn_actor(
+        &mut self,
         actor: A,
         args: A::Arguments,
     ) -> Result<ActorRef<A::Msg>, Error> {
@@ -34,10 +37,12 @@ impl ServiceManager {
         );
         let (json_actor, json_handle) = Actor::spawn(name, actor, args).await?;
         self.tracker.spawn(json_handle);
+        self.actors.push(json_actor.clone());
         Ok(json_actor)
     }
 
-    pub fn spawn<F, Fut>(&self, task: F) -> JoinHandle<()>
+    // Spawn through a function that receives a cancellation token
+    pub fn spawn_service<F, Fut>(&self, task: F) -> JoinHandle<()>
     where
         F: FnOnce(CancellationToken) -> Fut + Send + 'static,
         Fut: Future<Output = Result<()>> + Send,
@@ -52,14 +57,25 @@ impl ServiceManager {
             }
         })
     }
+    async fn stop(&self) -> Result<()> {
+        self.token.cancel();
+
+        for actor in self.actors.iter() {
+            actor.stop(Some("Terminating".to_string()));
+        }
+
+        // TODO: move 5 to some config, it's the same for http actor timeout
+        sleep(Duration::from_secs(5)).await;
+
+        Ok(())
+    }
 
     pub async fn manage(&self) -> Result<()> {
         self.tracker.close();
-        let token_clone = self.token.clone();
         #[cfg(unix)]
         let terminate = async {
             signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("failed to install signal handler")
+                .expect("Failed to install signal handler")
                 .recv()
                 .await;
         };
@@ -71,11 +87,11 @@ impl ServiceManager {
             _ = self.tracker.wait() => {},
             _ = signal::ctrl_c() => {
                 info!("Starting graceful termination, from ctrl-c");
-                token_clone.cancel();
+                self.stop().await?
             },
             _ = terminate => {
                 info!("Starting graceful termination, from terminate signal");
-                token_clone.cancel();
+                self.stop().await?
             },
         }
 

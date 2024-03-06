@@ -1,10 +1,12 @@
-use crate::services::nostr_service::{NostrActor, NostrActorMessage};
+use crate::actors::http_actor::{HttpActor, HttpActorMessage};
 use crate::utils::is_kind_free;
 use anyhow::Result;
 use chrono::Utc;
 use lazy_static::lazy_static;
 use nostr_sdk::prelude::*;
-use ractor::{concurrency::Duration, Actor, ActorProcessingErr, ActorRef, SupervisionEvent};
+use ractor::{
+    concurrency::Duration, Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -17,14 +19,14 @@ lazy_static! {
 
 pub struct JsonActor;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum JsonActorMessage {
+    GetStatsVec((), RpcReplyPort<Vec<(u32, KindEntry)>>),
     RecordEvent(Event, Url),
     SaveState,
-    Stop,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct KindEntry {
     event: Event,
     count: u64,
@@ -33,7 +35,7 @@ pub struct KindEntry {
 
 pub struct State {
     kind_stats: HashMap<u32, KindEntry>,
-    nostr_actor: ActorRef<NostrActorMessage>,
+    http_actor: ActorRef<HttpActorMessage>,
 }
 
 #[ractor::async_trait]
@@ -68,9 +70,9 @@ impl Actor for JsonActor {
         });
 
         myself.send_interval(Duration::from_secs(10), || JsonActorMessage::SaveState);
-        let (nostr_actor, _) = Actor::spawn_linked(
-            Some("NostrActor".to_string()),
-            NostrActor,
+        let (http_actor, _) = Actor::spawn_linked(
+            Some("HttpActor".to_string()),
+            HttpActor,
             myself.clone(),
             myself.into(),
         )
@@ -78,19 +80,10 @@ impl Actor for JsonActor {
 
         let state = State {
             kind_stats,
-            nostr_actor,
+            http_actor,
         };
 
         Ok(state)
-    }
-
-    async fn post_stop(
-        &self,
-        _: ActorRef<Self::Msg>,
-        _: &mut Self::State,
-    ) -> Result<(), ActorProcessingErr> {
-        info!("Json service exited");
-        Ok(())
     }
 
     async fn handle_supervisor_evt(
@@ -101,23 +94,32 @@ impl Actor for JsonActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             SupervisionEvent::ActorPanicked(dead_actor, panic_msg)
-                if dead_actor.get_id() == state.nostr_actor.get_id() =>
+                if dead_actor.get_id() == state.http_actor.get_id() =>
             {
-                tracing::info!("JsonActor: {dead_actor:?} panicked with '{panic_msg}'");
+                info!("JsonActor: {dead_actor:?} panicked with '{panic_msg}'");
 
-                tracing::info!("JsonActor: Terminating json actor");
+                info!("JsonActor: Terminating json actor");
                 myself.stop(Some("JsonActor died".to_string()));
             }
             other => {
-                tracing::info!("JsonActor: received supervisor event '{other}'");
+                info!("JsonActor: received supervisor event '{other}'");
             }
         }
         Ok(())
     }
 
+    async fn post_stop(
+        &self,
+        _: ActorRef<Self::Msg>,
+        _: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        info!("Json actor stopped");
+        Ok(())
+    }
+
     async fn handle(
         &self,
-        myself: ActorRef<Self::Msg>,
+        _myself: ActorRef<Self::Msg>,
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
@@ -140,8 +142,16 @@ impl Actor for JsonActor {
             JsonActorMessage::SaveState => {
                 save_stats_to_json(&state.kind_stats).await?;
             }
-            JsonActorMessage::Stop => {
-                myself.stop(None);
+            JsonActorMessage::GetStatsVec(_arg, reply) => {
+                let mut data_as_sorted_vec: Vec<(u32, KindEntry)> =
+                    state.kind_stats.clone().into_iter().collect();
+                data_as_sorted_vec.sort_by_key(|(kind, _)| *kind);
+                if !reply.is_closed() {
+                    info!("Sending sorted vec");
+                    if let Err(e) = reply.send(data_as_sorted_vec) {
+                        error!("Error when sending sorted vec: {}", e);
+                    }
+                }
             }
         }
 

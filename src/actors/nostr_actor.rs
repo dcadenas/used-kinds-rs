@@ -1,8 +1,8 @@
-use crate::services::json_service::JsonActorMessage;
+use crate::actors::json_actor::{JsonActor, JsonActorMessage};
 use crate::utils::is_kind_free;
 use anyhow::Result;
 use nostr_sdk::prelude::*;
-use ractor::{cast, concurrency::Duration, Actor, ActorProcessingErr, ActorRef};
+use ractor::{cast, concurrency::Duration, Actor, ActorProcessingErr, ActorRef, SupervisionEvent};
 use tracing::{debug, error, info};
 
 const POPULAR_RELAYS: [&str; 4] = [
@@ -66,12 +66,12 @@ pub enum NostrActorMessage {
 impl Actor for NostrActor {
     type Msg = NostrActorMessage;
     type State = State;
-    type Arguments = ActorRef<JsonActorMessage>;
+    type Arguments = ();
 
     async fn pre_start(
         &self,
         myself: ActorRef<Self::Msg>,
-        json_actor: ActorRef<JsonActorMessage>,
+        _arguments: (),
     ) -> Result<Self::State, ActorProcessingErr> {
         let opts = Options::new()
             .wait_for_send(false)
@@ -88,8 +88,12 @@ impl Actor for NostrActor {
 
         client.connect().await;
 
-        let duration = Duration::from_secs(60 * 5);
+        let duration = Duration::from_secs(5);
+        //let duration = Duration::from_secs(60 * 5);
         myself.send_interval(duration, || NostrActorMessage::GetEvents);
+        let (json_actor, _) =
+            Actor::spawn_linked(Some("JsonActor".to_string()), JsonActor, (), myself.into())
+                .await?;
 
         let state = State {
             json_actor: json_actor,
@@ -104,7 +108,29 @@ impl Actor for NostrActor {
         _: ActorRef<Self::Msg>,
         _state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        info!("Nostr service exited");
+        info!("Nostr actor stopped");
+        Ok(())
+    }
+
+    async fn handle_supervisor_evt(
+        &self,
+        myself: ActorRef<Self::Msg>,
+        message: SupervisionEvent,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        match message {
+            SupervisionEvent::ActorPanicked(dead_actor, panic_msg)
+                if dead_actor.get_id() == state.json_actor.get_id() =>
+            {
+                info!("NostrActor: {dead_actor:?} panicked with '{panic_msg}'");
+
+                info!("NostrActor: Terminating json actor");
+                myself.stop(Some("NostrActor died".to_string()));
+            }
+            other => {
+                info!("NostrActor: received supervisor event '{other}'");
+            }
+        }
         Ok(())
     }
 
@@ -117,8 +143,9 @@ impl Actor for NostrActor {
         match message {
             NostrActorMessage::GetEvents => {
                 state.get_events().await;
-                Ok(())
             }
         }
+
+        Ok(())
     }
 }
