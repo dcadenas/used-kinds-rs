@@ -88,8 +88,7 @@ impl Actor for NostrActor {
 
         client.connect().await;
 
-        let duration = Duration::from_secs(5);
-        //let duration = Duration::from_secs(60 * 5);
+        let duration = Duration::from_secs(60 * 5);
         myself.send_interval(duration, || NostrActorMessage::GetEvents);
         let (json_actor, _) =
             Actor::spawn_linked(Some("JsonActor".to_string()), JsonActor, (), myself.into())

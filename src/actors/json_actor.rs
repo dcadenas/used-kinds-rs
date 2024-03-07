@@ -38,6 +38,10 @@ pub struct State {
     http_actor: ActorRef<HttpActorMessage>,
 }
 
+fn is_old(unix_time: i64) -> bool {
+    unix_time < (Utc::now() - chrono::Duration::days(30)).timestamp_millis()
+}
+
 #[ractor::async_trait]
 impl Actor for JsonActor {
     type Msg = JsonActorMessage;
@@ -63,13 +67,9 @@ impl Actor for JsonActor {
             });
 
         // Remove any entries that are older than 1 month or for which is_kind_free is false
-        kind_stats.retain(|kind, entry| {
-            let is_old =
-                entry.last_updated < (Utc::now() - chrono::Duration::days(30)).timestamp_millis();
-            !is_old && is_kind_free(*kind)
-        });
+        kind_stats.retain(|kind, entry| !is_old(entry.last_updated) && is_kind_free(*kind));
 
-        myself.send_interval(Duration::from_secs(10), || JsonActorMessage::SaveState);
+        myself.send_interval(Duration::from_secs(60), || JsonActorMessage::SaveState);
         let (http_actor, _) = Actor::spawn_linked(
             Some("HttpActor".to_string()),
             HttpActor,
@@ -143,8 +143,13 @@ impl Actor for JsonActor {
                 save_stats_to_json(&state.kind_stats).await?;
             }
             JsonActorMessage::GetStatsVec(_arg, reply) => {
-                let mut data_as_sorted_vec: Vec<(u32, KindEntry)> =
-                    state.kind_stats.clone().into_iter().collect();
+                let mut data_as_sorted_vec: Vec<(u32, KindEntry)> = state
+                    .kind_stats
+                    .clone()
+                    .into_iter()
+                    .filter(|(_, v)| !is_old(v.last_updated))
+                    .collect();
+
                 data_as_sorted_vec.sort_by_key(|(kind, _)| *kind);
                 if !reply.is_closed() {
                     info!("Sending sorted vec");
