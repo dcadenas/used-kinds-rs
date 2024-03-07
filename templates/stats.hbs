@@ -206,6 +206,7 @@
 
             document.querySelectorAll('.row-toggle .toggle-indicator').forEach(toggle => {
                 toggle.addEventListener('click', (event) => {
+                    event.preventDefault();
                     event.stopPropagation();
                     const row = toggle.closest('.row-toggle');
                     let nextRow = row.nextElementSibling;
