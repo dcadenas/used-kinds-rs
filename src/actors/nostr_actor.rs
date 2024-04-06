@@ -6,13 +6,12 @@ use ractor::{cast, concurrency::Duration, Actor, ActorProcessingErr, ActorRef, S
 use std::collections::HashMap;
 use tracing::{error, info};
 
-const POPULAR_RELAYS: [&str; 6] = [
+const POPULAR_RELAYS: [&str; 5] = [
     "wss://relay.damus.io",
     "wss://relay.primal.net",
-    "wss://relay.nostr.pub",
-    "wss://relay.plebstr.com",
     "wss://relayable.org",
     "wss://relay.n057r.club",
+    "wss://relay.snort.social",
 ];
 
 pub struct NostrActor;
