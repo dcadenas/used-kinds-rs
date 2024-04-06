@@ -22,7 +22,7 @@ pub struct JsonActor;
 #[derive(Debug)]
 pub enum JsonActorMessage {
     GetStatsVec((), RpcReplyPort<Vec<(u32, KindEntry)>>),
-    RecordEvent(Event, Url),
+    RecordEvent(Event, String, Url),
     SaveState,
 }
 
@@ -31,6 +31,7 @@ pub struct KindEntry {
     event: Event,
     count: u64,
     last_updated: i64,
+    recommended_app: String,
 }
 
 pub struct State {
@@ -124,7 +125,7 @@ impl Actor for JsonActor {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
-            JsonActorMessage::RecordEvent(event, _url) => {
+            JsonActorMessage::RecordEvent(event, recommended_app, _url) => {
                 state
                     .kind_stats
                     .entry(event.kind.as_u32())
@@ -132,11 +133,13 @@ impl Actor for JsonActor {
                         e.event = event.clone();
                         e.count += 1;
                         e.last_updated = Utc::now().timestamp_millis();
+                        e.recommended_app = recommended_app.clone();
                     })
                     .or_insert_with(|| KindEntry {
                         event,
                         count: 1,
                         last_updated: Utc::now().timestamp_millis(),
+                        recommended_app,
                     });
             }
             JsonActorMessage::SaveState => {

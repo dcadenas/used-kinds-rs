@@ -1,0 +1,4 @@
+[env]
+RUST_LOG = "used_kinds_rs=info"
+PORT = "3000"
+STATS_FILE = "stats.json"

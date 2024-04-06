@@ -140,6 +140,7 @@
             <thead>
                 <tr>
                     <th>Kind <span class="sort-indicator"></span></th>
+                    <th>Recommended App <span class="sort-indicator"></span></th>
                     <th>Latest Event Sampled <span class="sort-indicator"></span></th>
                     <th>Seen Times <span class="sort-indicator"></span></th>
                     <th>Last Seen At <span class="sort-indicator"></span></th>
@@ -152,6 +153,7 @@
                     <td> <a
                             href="https://github.com/search?q=repo%3Anostr-protocol%2Fnips++%2Fkind.*%5Cb{{this.[0]}}%5Cb%2F&type=code">{{this.[0]}}</a>
                     </td>
+                    <td>{{this.[1].recommended_app}}</td>
                     <td class="toggle-indicator">
                         <span><i class="fas fa-chevron-down"></i></span>
                         <a href="#" class="event-link">{{this.[1].event.id}}</a>

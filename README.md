@@ -7,6 +7,7 @@ A service that monitors the Nostr network for event kinds not yet recognized by 
 
 **Data Treatment:**
 - Event kinds not seen for over a month are removed to maintain the dataset's relevance.
+- If available, recommended app info will be presented through [NIP-89](https://github.com/nostr-protocol/nips/blob/master/89.md) events.
 - I may add a json endpoint to fetch the data at some point but contributions are welcome.
 
 **Technical Details:**

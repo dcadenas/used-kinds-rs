@@ -3,10 +3,13 @@ use crate::utils::is_kind_free;
 use anyhow::Result;
 use nostr_sdk::prelude::*;
 use ractor::{cast, concurrency::Duration, Actor, ActorProcessingErr, ActorRef, SupervisionEvent};
-use tracing::{debug, error, info};
+use std::collections::HashMap;
+use tracing::{error, info};
 
-const POPULAR_RELAYS: [&str; 4] = [
+const POPULAR_RELAYS: [&str; 6] = [
     "wss://relay.damus.io",
+    "wss://relay.primal.net",
+    "wss://relay.nostr.pub",
     "wss://relay.plebstr.com",
     "wss://relayable.org",
     "wss://relay.n057r.club",
@@ -16,10 +19,11 @@ pub struct NostrActor;
 pub struct State {
     json_actor: ActorRef<JsonActorMessage>,
     client: Client,
+    recommended_aps: HashMap<Kind, (String, Timestamp)>,
 }
 
 impl State {
-    async fn get_events(&self) {
+    async fn get_events(&mut self) -> Result<()> {
         let amount = 1000;
 
         let duration = Duration::from_secs(60 * 5);
@@ -38,21 +42,78 @@ impl State {
         {
             Ok(events) => {
                 for event in events {
-                    if is_kind_free(event.kind.as_u32()) {
-                        debug!("Received a new kind event: {:?}", event);
-                        info!("Received a new event of kind {}", event.kind);
-                        // TODO: How can I know where was this event found? FTM it's hardcoded
-                        let relay_url = Url::parse("wss://relay.damus.io").unwrap();
-                        if let Err(e) = cast!(
-                            self.json_actor,
-                            JsonActorMessage::RecordEvent(event, relay_url)
-                        ) {
-                            error!("Failed to send the new kind event: {}", e);
-                        }
+                    if let Err(e) = self.process_event(event).await {
+                        error!("Failed to process event: {}", e);
                     }
                 }
             }
             Err(e) => error!("Failed to get events: {}", e),
+        }
+
+        Ok(())
+    }
+
+    async fn process_event(&mut self, event: Event) -> Result<()> {
+        if is_kind_free(event.kind.as_u32()) {
+            let current_time = Timestamp::now();
+            let five_mins_ago = current_time - Duration::from_secs(60 * 5);
+
+            let update_needed = match self.recommended_aps.get(&event.kind) {
+                Some((_, last_updated)) if *last_updated < five_mins_ago => true,
+                Some((recommended_app, _)) => {
+                    // If the recommended app is up-to-date, use it without updating.
+                    self.send_event(event.clone(), recommended_app.clone())
+                        .await?;
+                    false
+                }
+                None => true,
+            };
+
+            if update_needed {
+                // Fetch and update the recommended app if it's outdated or missing.
+                let recommended_app = self.get_recommended_app(event.kind).await?;
+                self.recommended_aps
+                    .insert(event.kind, (recommended_app.clone(), current_time));
+                self.send_event(event, recommended_app).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_event(&self, event: Event, recommended_app: String) -> Result<()> {
+        let relay_url = Url::parse("wss://relay.damus.io")?;
+        cast!(
+            self.json_actor,
+            JsonActorMessage::RecordEvent(event, recommended_app, relay_url)
+        )?;
+
+        Ok(())
+    }
+
+    async fn get_recommended_app(&self, kind: Kind) -> Result<String> {
+        let filters = vec![Filter::new()
+            .limit(1)
+            .kind(Kind::ParameterizedReplaceable(31990))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::K), [kind.to_string()])];
+        let recommended_apps = self
+            .client
+            .get_events_of(filters, Some(Duration::from_secs(1)))
+            .await?;
+
+        if let Some(app_event) = recommended_apps.first() {
+            let alt_tag_data_value = app_event.tags().iter().find_map(|t| match t {
+                Tag::Generic(TagKind::Custom(s), data) if s == "alt" && !data.is_empty() => {
+                    data.first()
+                }
+                _ => None,
+            });
+
+            let recommended_app = alt_tag_data_value.unwrap_or(&app_event.content).clone();
+
+            info!("Recommended app for kind {}: {}", kind, recommended_app);
+            Ok(recommended_app)
+        } else {
+            Ok("None found".to_string())
         }
     }
 }
@@ -88,8 +149,8 @@ impl Actor for NostrActor {
 
         client.connect().await;
 
-        let duration = Duration::from_secs(60 * 5);
-        myself.send_interval(duration, || NostrActorMessage::GetEvents);
+        let every_5_minutes = Duration::from_secs(60 * 5);
+        myself.send_interval(every_5_minutes, || NostrActorMessage::GetEvents);
         let (json_actor, _) =
             Actor::spawn_linked(Some("JsonActor".to_string()), JsonActor, (), myself.into())
                 .await?;
@@ -97,6 +158,7 @@ impl Actor for NostrActor {
         let state = State {
             json_actor: json_actor,
             client,
+            recommended_aps: HashMap::new(),
         };
 
         Ok(state)
@@ -141,7 +203,9 @@ impl Actor for NostrActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             NostrActorMessage::GetEvents => {
-                state.get_events().await;
+                if let Err(e) = state.get_events().await {
+                    error!("Failed to get events: {}", e)
+                };
             }
         }
 

@@ -1,5 +1,4 @@
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-
+use super::json_actor::JsonActorMessage;
 use anyhow::Result;
 use axum::{
     extract::State,
@@ -11,6 +10,7 @@ use axum::{
     routing::get,
     Router,
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{NaiveDateTime, Utc};
 use handlebars::{Handlebars, Helper, Output, RenderContext, RenderError, RenderErrorReason};
 use lazy_static::lazy_static;
@@ -25,8 +25,6 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::{error, info};
-
-use super::json_actor::JsonActorMessage;
 
 lazy_static! {
     static ref STATS_FILE: String =
@@ -79,7 +77,10 @@ impl Actor for HttpActor {
             .layer(TimeoutLayer::new(Duration::from_secs(1)))
             .with_state(web_app_state);
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+        let port = env::var("PORT")
+            .unwrap_or_else(|_| "8080".to_string())
+            .parse::<u16>()?;
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let cancellation_token = CancellationToken::new();
         let token_clone = cancellation_token.clone();
