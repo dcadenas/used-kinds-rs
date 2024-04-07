@@ -61,6 +61,7 @@ impl Actor for HttpActor {
         let mut hb = Handlebars::new();
         hb.register_helper("date_relative", Box::new(date_relative));
         hb.register_helper("json", Box::new(json_helper));
+        hb.register_helper("ellipsis", Box::new(ellipsis));
 
         if let Err(e) = hb.register_template_file("stats", "templates/stats.hbs") {
             error!("Failed to load template: {}", e);
@@ -73,6 +74,7 @@ impl Actor for HttpActor {
 
         let router = Router::new()
             .route("/", get(fetch_stats))
+            .route("/health", get(|| async { "OK" }))
             .layer(TraceLayer::new_for_http())
             .layer(TimeoutLayer::new(Duration::from_secs(1)))
             .with_state(web_app_state);
@@ -152,6 +154,40 @@ async fn fetch_stats(
         StatusCode::INTERNAL_SERVER_ERROR,
         Html("<h1>Error rendering the page</h1>".to_string()),
     )
+}
+
+fn shorten_with_ellipsis(s: &str, max_len: usize) -> String {
+    if s.len() > max_len {
+        format!("{}...", &s[..max_len])
+    } else {
+        s.to_string()
+    }
+}
+
+fn ellipsis(
+    h: &Helper,
+    _: &Handlebars,
+    _: &handlebars::Context,
+    _: &mut RenderContext,
+    out: &mut dyn Output,
+) -> Result<(), RenderError> {
+    let param = h
+        .param(0)
+        .ok_or(RenderErrorReason::ParamNotFoundForIndex("ellipsis", 0))?;
+
+    let s = param
+        .value()
+        .as_str()
+        .ok_or(RenderErrorReason::InvalidJsonPath("ellipsis".to_string()))?;
+    let max_len =
+        h.param(1)
+            .ok_or(RenderErrorReason::ParamNotFoundForIndex("ellipsis", 1))?
+            .value()
+            .as_u64()
+            .ok_or(RenderErrorReason::InvalidJsonPath("ellipsis".to_string()))? as usize;
+
+    out.write(&shorten_with_ellipsis(s, max_len))?;
+    Ok(())
 }
 
 fn date_relative(

@@ -1,6 +1,8 @@
+mod get_recommended_app;
 use crate::actors::json_actor::{JsonActor, JsonActorMessage};
 use crate::utils::is_kind_free;
 use anyhow::Result;
+use get_recommended_app::get_recommended_app;
 use nostr_sdk::prelude::*;
 use ractor::{cast, concurrency::Duration, Actor, ActorProcessingErr, ActorRef, SupervisionEvent};
 use std::collections::HashMap;
@@ -70,7 +72,7 @@ impl State {
 
             if update_needed {
                 // Fetch and update the recommended app if it's outdated or missing.
-                let recommended_app = self.get_recommended_app(event.kind).await?;
+                let recommended_app = get_recommended_app(&self.client, event.kind).await?;
                 self.recommended_aps
                     .insert(event.kind, (recommended_app.clone(), current_time));
                 self.send_event(event, recommended_app).await?;
@@ -87,33 +89,6 @@ impl State {
         )?;
 
         Ok(())
-    }
-
-    async fn get_recommended_app(&self, kind: Kind) -> Result<String> {
-        let filters = vec![Filter::new()
-            .limit(1)
-            .kind(Kind::ParameterizedReplaceable(31990))
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::K), [kind.to_string()])];
-        let recommended_apps = self
-            .client
-            .get_events_of(filters, Some(Duration::from_secs(1)))
-            .await?;
-
-        if let Some(app_event) = recommended_apps.first() {
-            let alt_tag_data_value = app_event.tags().iter().find_map(|t| match t {
-                Tag::Generic(TagKind::Custom(s), data) if s == "alt" && !data.is_empty() => {
-                    data.first()
-                }
-                _ => None,
-            });
-
-            let recommended_app = alt_tag_data_value.unwrap_or(&app_event.content).clone();
-
-            info!("Recommended app for kind {}: {}", kind, recommended_app);
-            Ok(recommended_app)
-        } else {
-            Ok("None found".to_string())
-        }
     }
 }
 
