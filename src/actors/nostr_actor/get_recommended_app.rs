@@ -48,6 +48,5 @@ async fn recommended_app_event(client: &Client, kind: Kind) -> Result<Option<Eve
     let recommended_apps = client
         .get_events_of(filters, Some(Duration::from_secs(1)))
         .await?;
-    let recommended_app_event = recommended_apps.first().map(|e| e.clone());
-    Ok(recommended_app_event)
+    Ok(recommended_apps.first().cloned())
 }

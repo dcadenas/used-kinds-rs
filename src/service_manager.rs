@@ -1,6 +1,6 @@
 use anyhow::{Error, Result};
 use ractor::{Actor, ActorRef};
-use tokio::macros::support::Future;
+use std::future::Future;
 use tokio::signal;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
@@ -41,6 +41,20 @@ impl<A: Actor> ServiceManager<A> {
         Ok(json_actor)
     }
 
+    async fn stop(&self) -> Result<()> {
+        self.token.cancel();
+
+        for actor in self.actors.iter() {
+            actor.stop(Some("Terminating".to_string()));
+        }
+
+        // TODO: move 5 to some config, it's the same for http actor timeout
+        sleep(Duration::from_secs(5)).await;
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     // Spawn through a function that receives a cancellation token
     pub fn spawn_service<F, Fut>(&self, task: F) -> JoinHandle<()>
     where
@@ -56,18 +70,6 @@ impl<A: Actor> ServiceManager<A> {
                 token_clone.cancel();
             }
         })
-    }
-    async fn stop(&self) -> Result<()> {
-        self.token.cancel();
-
-        for actor in self.actors.iter() {
-            actor.stop(Some("Terminating".to_string()));
-        }
-
-        // TODO: move 5 to some config, it's the same for http actor timeout
-        sleep(Duration::from_secs(5)).await;
-
-        Ok(())
     }
 
     pub async fn manage(&self) -> Result<()> {

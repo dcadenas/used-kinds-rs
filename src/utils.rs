@@ -99,7 +99,6 @@ static TAKEN_KINDS: [u32; 84] = [
 ///
 /// Returns `true` if the kind is free; otherwise, returns `false`.
 pub fn is_kind_free(kind: u32) -> bool {
-    !TAKEN_KINDS.contains(&kind)
-        && !(kind >= 5000 && kind <= 6999)
-        && !(kind >= 9000 && kind <= 9030)
+    !(TAKEN_KINDS.contains(&kind) || (5000..=6999).contains(&kind) || (9000..=9030).contains(&kind))
 }
+

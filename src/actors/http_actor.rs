@@ -124,11 +124,9 @@ impl Actor for HttpActor {
     }
 }
 
-fn shutdown_hook(cancellation_token: CancellationToken) -> impl Future<Output = ()> {
-    async move {
-        cancellation_token.cancelled().await;
-        info!("Exiting the process");
-    }
+async fn shutdown_hook(cancellation_token: CancellationToken) {
+    cancellation_token.cancelled().await;
+    info!("Exiting the process");
 }
 
 async fn fetch_stats(
@@ -238,8 +236,7 @@ fn json_helper(
 
     let serialized = serde_json::to_string_pretty(param.value())
         .map_err(|_e| RenderErrorReason::InvalidJsonPath("json".to_string()))?;
-
-    let encoded = STANDARD.encode(&serialized);
+    let encoded = STANDARD.encode(serialized);
 
     out.write(&encoded)?;
     Ok(())

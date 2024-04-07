@@ -130,7 +130,7 @@ impl Actor for NostrActor {
                 .await?;
 
         let state = State {
-            json_actor: json_actor,
+            json_actor,
             client,
             recommended_aps: HashMap::new(),
         };
