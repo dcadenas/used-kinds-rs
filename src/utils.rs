@@ -1,3 +1,5 @@
+use nostr_sdk::prelude::Kind;
+
 // List of taken kinds, including comments for clarity.
 // These kinds are based on the latest Nostr NIPs documentation.
 static TAKEN_KINDS: [u32; 84] = [
@@ -98,7 +100,7 @@ static TAKEN_KINDS: [u32; 84] = [
 /// # Returns
 ///
 /// Returns `true` if the kind is free; otherwise, returns `false`.
-pub fn is_kind_free(kind: u32) -> bool {
+pub fn is_kind_free(kind: Kind) -> bool {
+    let kind = kind.as_u32();
     !(TAKEN_KINDS.contains(&kind) || (5000..=6999).contains(&kind) || (9000..=9030).contains(&kind))
 }
-

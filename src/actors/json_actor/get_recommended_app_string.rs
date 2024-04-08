@@ -1,10 +1,9 @@
 use anyhow::Result;
 use nostr_sdk::prelude::*;
-use ractor::concurrency::Duration;
 
-pub async fn get_recommended_app(client: &Client, kind: Kind) -> Result<String> {
-    let recommended_app_event = recommended_app_event(client, kind).await?;
-
+pub fn parse_recommended_app(
+    recommended_app_event: Option<&Event>,
+) -> Result<(Box<[Kind]>, String)> {
     match recommended_app_event {
         Some(app_event) => {
             let alt_tag_data = app_event.tags().iter().find_map(|tag| match tag {
@@ -15,6 +14,20 @@ pub async fn get_recommended_app(client: &Client, kind: Kind) -> Result<String> 
                 }
                 _ => None,
             });
+
+            let kind_tag_data: Box<[Kind]> = app_event
+                .tags()
+                .iter()
+                .filter_map(|tag| match tag {
+                    Tag::Generic(TagKind::Custom(tag_name), data)
+                        if tag_name == "k" && !data.is_empty() =>
+                    {
+                        data.first()
+                            .and_then(|kind_string| kind_string.parse::<u64>().ok().map(Kind::from))
+                    }
+                    _ => None,
+                })
+                .collect();
 
             let content_value = if app_event.content.trim().is_empty() {
                 None
@@ -32,21 +45,13 @@ pub async fn get_recommended_app(client: &Client, kind: Kind) -> Result<String> 
                     .find_map(|value| value.as_str().map(String::from))
             };
 
-            Ok(alt_tag_data
-                .or(content_value)
-                .unwrap_or_else(|| "None found".to_string()))
+            Ok((
+                kind_tag_data,
+                alt_tag_data
+                    .or(content_value)
+                    .unwrap_or_else(|| "None found".to_string()),
+            ))
         }
-        None => Ok("None found".to_string()),
+        None => Ok(([].into(), "None found".to_string())),
     }
-}
-
-async fn recommended_app_event(client: &Client, kind: Kind) -> Result<Option<Event>> {
-    let filters = vec![Filter::new()
-        .limit(1)
-        .kind(Kind::ParameterizedReplaceable(31990))
-        .custom_tag(SingleLetterTag::lowercase(Alphabet::K), [kind.to_string()])];
-    let recommended_apps = client
-        .get_events_of(filters, Some(Duration::from_secs(1)))
-        .await?;
-    Ok(recommended_apps.first().cloned())
 }

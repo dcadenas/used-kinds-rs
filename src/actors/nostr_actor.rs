@@ -1,11 +1,11 @@
-mod get_recommended_app;
-use crate::actors::json_actor::{JsonActor, JsonActorMessage};
-use crate::utils::is_kind_free;
+use crate::{
+    actors::json_actor::{JsonActor, JsonActorMessage},
+    utils::is_kind_free,
+};
 use anyhow::Result;
-use get_recommended_app::get_recommended_app;
 use nostr_sdk::prelude::*;
 use ractor::{cast, concurrency::Duration, Actor, ActorProcessingErr, ActorRef, SupervisionEvent};
-use std::collections::HashMap;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 const POPULAR_RELAYS: [&str; 5] = [
@@ -17,84 +17,62 @@ const POPULAR_RELAYS: [&str; 5] = [
 ];
 
 pub struct NostrActor;
+
+#[derive(Clone)]
 pub struct State {
+    cancellation_token: CancellationToken,
     json_actor: ActorRef<JsonActorMessage>,
     client: Client,
-    recommended_aps: HashMap<Kind, (String, Timestamp)>,
 }
 
 impl State {
-    async fn get_events(&mut self) -> Result<()> {
-        let amount = 1000;
+    async fn get_events(&self, cancellation_token: CancellationToken) -> Result<()> {
+        let filters = vec![Filter::new()];
 
-        let duration = Duration::from_secs(60 * 5);
+        self.client.subscribe(filters.clone()).await;
+        self.client
+            .handle_notifications(|notification| async {
+                if cancellation_token.is_cancelled() {
+                    // true breaks the loop
+                    return Ok(true);
+                }
 
-        let since = Timestamp::now() - duration;
-        let filters = vec![Filter::new().limit(amount).since(since)];
-
-        match self
-            .client
-            .get_events_of_with_opts(
-                filters,
-                Some(Duration::from_secs(60)),
-                FilterOptions::WaitDurationAfterEOSE(Duration::from_secs(10)),
-            )
-            .await
-        {
-            Ok(events) => {
-                for event in events {
-                    if let Err(e) = self.process_event(event).await {
-                        error!("Failed to process event: {}", e);
+                if let RelayPoolNotification::Event { event, .. } = notification {
+                    if is_kind_free(event.kind) {
+                        let relay_url = Url::parse("wss://relay.damus.io")?;
+                        if let Err(e) = cast!(
+                            self.json_actor,
+                            JsonActorMessage::RecordEvent(event, relay_url)
+                        ) {
+                            error!("Failed to process event: {}", e);
+                        }
                     }
                 }
-            }
-            Err(e) => error!("Failed to get events: {}", e),
-        }
+                Ok(false)
+            })
+            .await?;
 
         Ok(())
     }
 
-    async fn process_event(&mut self, event: Event) -> Result<()> {
-        if is_kind_free(event.kind.as_u32()) {
-            let current_time = Timestamp::now();
-            let five_mins_ago = current_time - Duration::from_secs(60 * 5);
+    async fn get_recommended_app_event(&mut self, kind: Kind) -> Result<Option<Event>> {
+        let filters = vec![Filter::new()
+            .limit(1)
+            .kind(Kind::ParameterizedReplaceable(31990))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::K), [kind.to_string()])];
 
-            let update_needed = match self.recommended_aps.get(&event.kind) {
-                Some((_, last_updated)) if *last_updated < five_mins_ago => true,
-                Some((recommended_app, _)) => {
-                    // If the recommended app is up-to-date, use it without updating.
-                    self.send_event(event.clone(), recommended_app.clone())
-                        .await?;
-                    false
-                }
-                None => true,
-            };
+        let recommended_apps = self
+            .client
+            .get_events_of(filters, Some(Duration::from_secs(1)))
+            .await?;
 
-            if update_needed {
-                // Fetch and update the recommended app if it's outdated or missing.
-                let recommended_app = get_recommended_app(&self.client, event.kind).await?;
-                self.recommended_aps
-                    .insert(event.kind, (recommended_app.clone(), current_time));
-                self.send_event(event, recommended_app).await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn send_event(&self, event: Event, recommended_app: String) -> Result<()> {
-        let relay_url = Url::parse("wss://relay.damus.io")?;
-        cast!(
-            self.json_actor,
-            JsonActorMessage::RecordEvent(event, recommended_app, relay_url)
-        )?;
-
-        Ok(())
+        Ok(recommended_apps.first().cloned())
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum NostrActorMessage {
-    GetEvents,
+    GetRecommendedApp(Kind),
 }
 
 #[ractor::async_trait]
@@ -123,17 +101,33 @@ impl Actor for NostrActor {
 
         client.connect().await;
 
-        let every_5_minutes = Duration::from_secs(60 * 5);
-        myself.send_interval(every_5_minutes, || NostrActorMessage::GetEvents);
-        let (json_actor, _) =
-            Actor::spawn_linked(Some("JsonActor".to_string()), JsonActor, (), myself.into())
-                .await?;
+        let (json_actor, _) = Actor::spawn_linked(
+            Some("JsonActor".to_string()),
+            JsonActor,
+            myself.clone(),
+            myself.into(),
+        )
+        .await?;
 
+        let cancellation_token = CancellationToken::new();
+        let cancellation_token_clone = cancellation_token.clone();
         let state = State {
             json_actor,
             client,
-            recommended_aps: HashMap::new(),
+            cancellation_token,
         };
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            while !cancellation_token_clone.is_cancelled() {
+                let token_clone = cancellation_token_clone.clone();
+                if let Err(e) = state_clone.get_events(token_clone).await {
+                    error!("Failed to get events: {}", e);
+                }
+
+                // TODO: Exponential backoff
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
 
         Ok(state)
     }
@@ -141,9 +135,10 @@ impl Actor for NostrActor {
     async fn post_stop(
         &self,
         _: ActorRef<Self::Msg>,
-        _state: &mut Self::State,
+        state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         info!("Nostr actor stopped");
+        state.cancellation_token.cancel();
         Ok(())
     }
 
@@ -176,9 +171,16 @@ impl Actor for NostrActor {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
-            NostrActorMessage::GetEvents => {
-                if let Err(e) = state.get_events().await {
-                    error!("Failed to get events: {}", e)
+            NostrActorMessage::GetRecommendedApp(kind) => {
+                match state.get_recommended_app_event(kind).await {
+                    Ok(maybe_app_event) => {
+                        let relay_url = Url::parse("wss://relay.damus.io")?;
+                        cast!(
+                            state.json_actor,
+                            JsonActorMessage::RecordRecommendedApp(maybe_app_event, relay_url)
+                        )?;
+                    }
+                    Err(e) => error!("Failed to get recommended app event: {}", e),
                 };
             }
         }
