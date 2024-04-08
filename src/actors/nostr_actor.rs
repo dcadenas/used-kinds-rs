@@ -29,7 +29,7 @@ impl State {
     async fn get_events(&self, cancellation_token: CancellationToken) -> Result<()> {
         let filters = vec![Filter::new()];
 
-        self.client.subscribe(filters.clone()).await;
+        self.client.subscribe(filters.clone(), None).await;
         self.client
             .handle_notifications(|notification| async {
                 if cancellation_token.is_cancelled() {
@@ -42,7 +42,7 @@ impl State {
                         let relay_url = Url::parse("wss://relay.damus.io")?;
                         if let Err(e) = cast!(
                             self.json_actor,
-                            JsonActorMessage::RecordEvent(event, relay_url)
+                            JsonActorMessage::RecordEvent(*event, relay_url)
                         ) {
                             error!("Failed to process event: {}", e);
                         }
@@ -89,10 +89,8 @@ impl Actor for NostrActor {
         let opts = Options::new()
             .wait_for_send(false)
             .connection_timeout(Some(Duration::from_secs(5)))
-            .shutdown_on_drop(true)
             .wait_for_subscription(true);
 
-        opts.pool.shutdown_on_drop(true);
         let client = ClientBuilder::new().opts(opts).build();
 
         for relay in POPULAR_RELAYS.into_iter() {

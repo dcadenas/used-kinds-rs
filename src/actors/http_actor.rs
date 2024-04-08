@@ -1,4 +1,5 @@
 use super::json_actor::JsonActorMessage;
+use ::base64::{engine::general_purpose::STANDARD, Engine as _};
 use anyhow::Result;
 use axum::{
     extract::State,
@@ -10,8 +11,7 @@ use axum::{
     routing::get,
     Router,
 };
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use chrono::{NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use handlebars::{Handlebars, Helper, Output, RenderContext, RenderError, RenderErrorReason};
 use lazy_static::lazy_static;
 use nostr_sdk::prelude::*;
@@ -197,10 +197,10 @@ fn date_relative(
 ) -> Result<(), RenderError> {
     let timestamp = h.param(0).unwrap().value().as_u64().unwrap();
 
-    let dt: Option<NaiveDateTime> = NaiveDateTime::from_timestamp_opt((timestamp / 1000) as i64, 0);
+    let dt = DateTime::from_timestamp((timestamp / 1000) as i64, 0);
     let ago = match dt {
         Some(dt) => {
-            let now = Utc::now().naive_utc();
+            let now = Utc::now();
             let duration = now.signed_duration_since(dt);
             if duration.num_seconds() < 60 {
                 "just now".to_string()
