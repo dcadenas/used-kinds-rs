@@ -1,4 +1,5 @@
 use nostr_sdk::prelude::Kind;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // List of taken kinds, including comments for clarity.
 // These kinds are based on the latest Nostr NIPs documentation.
@@ -88,7 +89,6 @@ static TAKEN_KINDS: [u32; 84] = [
     31989, // Handler recommendation
     31990, // Handler information
     34550, // Community Definition
-           // Additional kinds based on the provided range
 ];
 
 /// Checks if a kind is free (not taken) according to Nostr NIPs.
@@ -103,4 +103,12 @@ static TAKEN_KINDS: [u32; 84] = [
 pub fn is_kind_free(kind: Kind) -> bool {
     let kind = kind.as_u32();
     !(TAKEN_KINDS.contains(&kind) || (5000..=6999).contains(&kind) || (9000..=9030).contains(&kind))
+}
+
+pub fn should_log() -> bool {
+    let interval_seconds = 10;
+    let now = SystemTime::now();
+    let since_the_epoch = now.duration_since(UNIX_EPOCH).expect("Time went backwards");
+
+    since_the_epoch.as_secs() % interval_seconds == 0
 }

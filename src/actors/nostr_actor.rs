@@ -1,17 +1,18 @@
 use crate::{
     actors::json_actor::{JsonActor, JsonActorMessage},
-    utils::is_kind_free,
+    utils::{is_kind_free, should_log},
 };
 use anyhow::Result;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use nostr_sdk::prelude::*;
 use ractor::{cast, concurrency::Duration, Actor, ActorProcessingErr, ActorRef, SupervisionEvent};
+use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
-const POPULAR_RELAYS: [&str; 5] = [
+const POPULAR_RELAYS: [&str; 4] = [
     "wss://relay.damus.io",
     "wss://relay.primal.net",
-    "wss://relayable.org",
     "wss://relay.n057r.club",
     "wss://relay.snort.social",
 ];
@@ -20,16 +21,24 @@ pub struct NostrActor;
 
 #[derive(Clone)]
 pub struct State {
-    cancellation_token: CancellationToken,
+    cancellation_token: Option<CancellationToken>,
     json_actor: ActorRef<JsonActorMessage>,
     client: Client,
+    subscription_ids: HashMap<SubscriptionId, ()>,
+    latest_event_received_at: DateTime<Utc>,
 }
 
 impl State {
-    async fn get_events(&self, cancellation_token: CancellationToken) -> Result<()> {
-        let filters = vec![Filter::new()];
+    async fn get_events(
+        &self,
+        nostr_actor: &ActorRef<NostrActorMessage>,
+        cancellation_token: CancellationToken,
+    ) -> Result<()> {
+        let filters = vec![Filter::new().limit(1)];
+        info!("Filter is {:?}", filters);
 
-        self.client.subscribe(filters.clone(), None).await;
+        let main_sub_id = self.client.subscribe(filters.clone(), None).await;
+        info!("Main sub id is {}", main_sub_id);
         self.client
             .handle_notifications(|notification| async {
                 if cancellation_token.is_cancelled() {
@@ -37,42 +46,141 @@ impl State {
                     return Ok(true);
                 }
 
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    if is_kind_free(event.kind) {
-                        let relay_url = Url::parse("wss://relay.damus.io")?;
-                        if let Err(e) = cast!(
-                            self.json_actor,
-                            JsonActorMessage::RecordEvent(*event, relay_url)
-                        ) {
-                            error!("Failed to process event: {}", e);
+                match notification {
+                    RelayPoolNotification::Event {
+                        event,
+                        subscription_id,
+                        relay_url,
+                    } => {
+                        cast!(
+                            nostr_actor,
+                            NostrActorMessage::NewEvent(event, subscription_id, relay_url)
+                        )?;
+                        Ok(false)
+                    }
+                    RelayPoolNotification::Message { message, .. } => {
+                        match message {
+                            RelayMessage::Notice { message, .. } => {
+                                info!("Received notice: {:?}", message);
+                            }
+                            RelayMessage::Closed {
+                                subscription_id,
+                                message,
+                            } => {
+                                info!("Subscription {} closed: {}", subscription_id, message);
+                                if subscription_id == main_sub_id {
+                                    return Ok(true);
+                                }
+                            }
+                            RelayMessage::Event {
+                                subscription_id, ..
+                            } => {
+                                debug!("Received message for sub: {}", subscription_id);
+                            }
+                            _ => {
+                                debug!("Received message: {:?}", message);
+                            }
                         }
+                        Ok(false)
+                    }
+                    RelayPoolNotification::RelayStatus { relay_url, status } => {
+                        info!("Relay status: {:?} - {:?}", relay_url, status);
+                        Ok(false)
+                    }
+                    RelayPoolNotification::Stop => {
+                        info!("Stop");
+                        Ok(true)
+                    }
+                    RelayPoolNotification::Shutdown => {
+                        info!("Shutdown");
+                        Ok(true)
                     }
                 }
-                Ok(false)
             })
             .await?;
 
         Ok(())
     }
 
-    async fn get_recommended_app_event(&mut self, kind: Kind) -> Result<Option<Event>> {
+    async fn subscribe_recommended_app_query(&mut self, kind: Kind) {
         let filters = vec![Filter::new()
             .limit(1)
             .kind(Kind::ParameterizedReplaceable(31990))
             .custom_tag(SingleLetterTag::lowercase(Alphabet::K), [kind.to_string()])];
 
-        let recommended_apps = self
-            .client
-            .get_events_of(filters, Some(Duration::from_secs(1)))
-            .await?;
+        let opts = SubscribeAutoCloseOptions::default()
+            .timeout(Some(Duration::from_secs(5)))
+            .filter(FilterOptions::ExitOnEOSE);
 
-        Ok(recommended_apps.first().cloned())
+        let id = SubscriptionId::generate();
+        self.subscription_ids.insert(id.clone(), ());
+        self.client
+            .subscribe_with_id(id.clone(), filters, Some(opts))
+            .await;
+
+        if should_log() {
+            info!(
+                "Subscribed to recommended app event for kind {:?} with subscription id {}. Current subscriptions: {}",
+                kind, id, self.subscription_ids.len()
+            );
+        }
+    }
+
+    fn reset_notification_handler(&mut self, myself: ActorRef<NostrActorMessage>) {
+        info!("Resetting subscription_ids");
+        self.subscription_ids.clear();
+        self.latest_event_received_at = Utc::now();
+        if let Some(c) = self.cancellation_token.as_ref() {
+            c.cancel()
+        }
+        let cancellation_token = CancellationToken::new();
+        self.cancellation_token = Some(cancellation_token.clone());
+
+        let state_clone = self.clone();
+        let token_clone = cancellation_token.clone();
+        let myself_clone = myself.clone();
+        let join_handler = tokio::spawn(async move {
+            loop {
+                let token_clone = token_clone.clone();
+                if let Err(e) = state_clone
+                    .get_events(&myself_clone, token_clone.clone())
+                    .await
+                {
+                    error!("Failed to get events: {}", e);
+                }
+
+                if token_clone.is_cancelled() {
+                    break;
+                }
+
+                // TODO: exponential backoff
+                warn!("Subscription closed, reconnecting in 60 seconds");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+
+            info!("Notification handler stopped");
+        });
+
+        let token_clone = cancellation_token.clone();
+        let myself_clone = myself.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60 * 5));
+            while !token_clone.is_cancelled() {
+                interval.tick().await;
+                if let Err(e) = cast!(&myself_clone, NostrActorMessage::HealthCheck) {
+                    error!("Failed to reset notification handler: {}", e);
+                }
+            }
+            join_handler.abort();
+        });
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum NostrActorMessage {
     GetRecommendedApp(Kind),
+    NewEvent(Box<Event>, SubscriptionId, Url),
+    HealthCheck,
 }
 
 #[ractor::async_trait]
@@ -88,13 +196,14 @@ impl Actor for NostrActor {
     ) -> Result<Self::State, ActorProcessingErr> {
         let opts = Options::new()
             .wait_for_send(false)
-            .connection_timeout(Some(Duration::from_secs(5)))
+            .connection_timeout(Some(Duration::from_secs(60)))
             .wait_for_subscription(true);
 
         let client = ClientBuilder::new().opts(opts).build();
 
+        let opts = RelayOptions::default().ping(true);
         for relay in POPULAR_RELAYS.into_iter() {
-            client.add_relay(relay).await?;
+            client.add_relay_with_opts(relay, opts.clone()).await?;
         }
 
         client.connect().await;
@@ -103,29 +212,19 @@ impl Actor for NostrActor {
             Some("JsonActor".to_string()),
             JsonActor,
             myself.clone(),
-            myself.into(),
+            myself.clone().into(),
         )
         .await?;
 
-        let cancellation_token = CancellationToken::new();
-        let cancellation_token_clone = cancellation_token.clone();
-        let state = State {
+        let mut state = State {
             json_actor,
             client,
-            cancellation_token,
+            cancellation_token: None,
+            subscription_ids: HashMap::new(),
+            latest_event_received_at: Utc::now(),
         };
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            while !cancellation_token_clone.is_cancelled() {
-                let token_clone = cancellation_token_clone.clone();
-                if let Err(e) = state_clone.get_events(token_clone).await {
-                    error!("Failed to get events: {}", e);
-                }
 
-                // TODO: Exponential backoff
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-        });
+        state.reset_notification_handler(myself);
 
         Ok(state)
     }
@@ -136,7 +235,9 @@ impl Actor for NostrActor {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         info!("Nostr actor stopped");
-        state.cancellation_token.cancel();
+        if let Some(c) = state.cancellation_token.as_ref() {
+            c.cancel()
+        }
         Ok(())
     }
 
@@ -164,22 +265,39 @@ impl Actor for NostrActor {
 
     async fn handle(
         &self,
-        _myself: ActorRef<Self::Msg>,
+        myself: ActorRef<Self::Msg>,
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
             NostrActorMessage::GetRecommendedApp(kind) => {
-                match state.get_recommended_app_event(kind).await {
-                    Ok(maybe_app_event) => {
-                        let relay_url = Url::parse("wss://relay.damus.io")?;
-                        cast!(
-                            state.json_actor,
-                            JsonActorMessage::RecordRecommendedApp(maybe_app_event, relay_url)
-                        )?;
-                    }
-                    Err(e) => error!("Failed to get recommended app event: {}", e),
-                };
+                state.subscribe_recommended_app_query(kind).await;
+            }
+            NostrActorMessage::HealthCheck => {
+                if state.latest_event_received_at + ChronoDuration::seconds(60 * 5) < Utc::now() {
+                    warn!(
+                        "No events received in the last 5 minutes, resetting notification handler"
+                    );
+
+                    state.reset_notification_handler(myself);
+                }
+            }
+            NostrActorMessage::NewEvent(event, subscription_id, relay_url) => {
+                state.latest_event_received_at = Utc::now();
+
+                if state.subscription_ids.contains_key(&subscription_id) {
+                    state.subscription_ids.remove(&subscription_id);
+
+                    cast!(
+                        state.json_actor,
+                        JsonActorMessage::RecordRecommendedApp(event, relay_url)
+                    )?;
+                } else if is_kind_free(event.kind) {
+                    cast!(
+                        state.json_actor,
+                        JsonActorMessage::RecordEvent(event, relay_url)
+                    )?;
+                }
             }
         }
 

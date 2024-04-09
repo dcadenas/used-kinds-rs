@@ -2,6 +2,7 @@ mod get_recommended_app_string;
 use super::nostr_actor::NostrActorMessage;
 use crate::actors::http_actor::{HttpActor, HttpActorMessage};
 use crate::utils::is_kind_free;
+use crate::utils::should_log;
 use anyhow::Result;
 use chrono::Utc;
 use get_recommended_app_string::parse_recommended_app;
@@ -14,8 +15,7 @@ use ractor::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 lazy_static! {
     static ref STATS_FILE: String =
@@ -27,8 +27,8 @@ pub struct JsonActor;
 #[derive(Debug)]
 pub enum JsonActorMessage {
     GetStatsVec((), RpcReplyPort<Vec<(Kind, KindEntry)>>),
-    RecordEvent(Event, Url),
-    RecordRecommendedApp(Option<Event>, Url),
+    RecordEvent(Box<Event>, Url),
+    RecordRecommendedApp(Box<Event>, Url),
     SaveState,
 }
 
@@ -45,20 +45,21 @@ pub struct State {
     kind_stats: HashMap<Kind, KindEntry>,
     http_actor: ActorRef<HttpActorMessage>,
     nostr_actor: ActorRef<NostrActorMessage>,
-    recommended_apps: HashMap<Kind, (String, Timestamp)>,
+    recommended_apps: HashMap<Kind, Timestamp>,
 }
 
 impl State {
     fn maybe_refresh_recommended_app(&mut self, kind: Kind) -> Result<()> {
         let current_time = Timestamp::now();
-        let five_mins_ago = current_time - Duration::from_secs(60 * 5);
+        let one_hour_ago = current_time - Duration::from_secs(60 * 60);
 
         let update_needed = match self.recommended_apps.get(&kind) {
-            Some((_, last_updated)) => *last_updated < five_mins_ago,
+            Some(last_updated) => *last_updated < one_hour_ago,
             None => true,
         };
 
         if update_needed {
+            self.recommended_apps.insert(kind, current_time);
             cast!(self.nostr_actor, NostrActorMessage::GetRecommendedApp(kind))?;
         }
 
@@ -164,12 +165,12 @@ impl Actor for JsonActor {
                     .kind_stats
                     .entry(event.kind)
                     .and_modify(|e| {
-                        e.event = event.clone();
+                        e.event = *event.clone();
                         e.count += 1;
                         e.last_updated = Utc::now().timestamp_millis();
                     })
                     .or_insert_with(|| KindEntry {
-                        event: event.clone(),
+                        event: *event.clone(),
                         count: 1,
                         last_updated: Utc::now().timestamp_millis(),
                         recommended_app: None,
@@ -181,12 +182,12 @@ impl Actor for JsonActor {
                 }
             }
             JsonActorMessage::RecordRecommendedApp(event, _url) => {
-                match parse_recommended_app(event.as_ref()) {
+                match parse_recommended_app(&event) {
                     Ok((kinds, recommended_app)) => {
                         kinds.iter().for_each(|kind| {
                             state.kind_stats.entry(*kind).and_modify(|e| {
                                 e.recommended_app = Some(recommended_app.clone());
-                                e.recommended_app_event = event.clone();
+                                e.recommended_app_event = Some(*event.clone());
                             });
                         });
                     }
@@ -221,14 +222,6 @@ impl Actor for JsonActor {
 async fn save_stats_to_json(kind_stats: &HashMap<Kind, KindEntry>) -> Result<()> {
     let json_str = serde_json::to_string_pretty(kind_stats)?;
     tokio::fs::write(&*STATS_FILE, json_str).await?;
-    info!("Stats saved to json file");
+    debug!("Stats saved to json file");
     Ok(())
-}
-
-fn should_log() -> bool {
-    let interval_seconds = 10;
-    let now = SystemTime::now();
-    let since_the_epoch = now.duration_since(UNIX_EPOCH).expect("Time went backwards");
-
-    since_the_epoch.as_secs() % interval_seconds == 0
 }
