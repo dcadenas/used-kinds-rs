@@ -4,7 +4,7 @@ use nostr_sdk::prelude::*;
 pub fn parse_recommended_app(app_event: &Event) -> Result<(Box<[Kind]>, String)> {
     let alt_tag_data = app_event.tags().iter().find_map(|tag| match tag {
         Tag::Generic(TagKind::Custom(tag_name), data) if tag_name == "alt" && !data.is_empty() => {
-            data.first().cloned() // Prefer `cloned()` over `map(|s| s.clone())`
+            data.first().cloned()
         }
         _ => None,
     });

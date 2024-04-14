@@ -5,6 +5,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, Method, StatusCode},
     response::Html,
+    response::Json,
 };
 use axum::{
     response::IntoResponse, // Import Json for JSON responses
@@ -16,6 +17,7 @@ use handlebars::{Handlebars, Helper, Output, RenderContext, RenderError, RenderE
 use lazy_static::lazy_static;
 use nostr_sdk::prelude::*;
 use ractor::{call, concurrency::Duration, Actor, ActorProcessingErr, ActorRef};
+use serde_json::json;
 use std::env;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -23,6 +25,8 @@ use std::sync::Arc;
 use tokio::macros::support::Pin;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+use tower_http::cors::{Any, CorsLayer};
+
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::{error, info};
 
@@ -72,9 +76,15 @@ impl Actor for HttpActor {
             json_actor,
         };
 
+        let cors = CorsLayer::new()
+            .allow_methods([Method::GET])
+            .allow_origin(Any);
+
         let router = Router::new()
             .route("/", get(fetch_stats))
+            .route("/json", get(fetch_raw_stats))
             .route("/health", get(|| async { "OK" }))
+            .layer(cors)
             .layer(TraceLayer::new_for_http())
             .layer(TimeoutLayer::new(Duration::from_secs(1)))
             .with_state(web_app_state);
@@ -152,6 +162,26 @@ async fn fetch_stats(
         StatusCode::INTERNAL_SERVER_ERROR,
         Html("<h1>Error rendering the page</h1>".to_string()),
     )
+}
+
+async fn fetch_raw_stats(
+    _: Method,
+    _: HeaderMap,
+    State(app_state): State<WebAppState>,
+) -> impl IntoResponse {
+    match call!(app_state.json_actor, JsonActorMessage::GetStatsVec, ()) {
+        Ok(stats_vec) => {
+            let json = json!(stats_vec);
+            (StatusCode::OK, Json(json))
+        }
+        Err(e) => {
+            error!("Error returning json: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Error something went wrong"})),
+            )
+        }
+    }
 }
 
 fn shorten_with_ellipsis(s: &str, max_len: usize) -> String {

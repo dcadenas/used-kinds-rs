@@ -47,13 +47,17 @@
             background-color: #1e1e1e;
             color: #e0e0e0;
         }
-        th, td {
-    padding: 12px 15px;
-    text-align: left;
-    border-bottom: 1px solid #333;
-    word-wrap: break-word; /* Ensures text wraps within the cell */
-    min-width: 100px; /* Example minimum width */
-}
+
+        th,
+        td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #333;
+            word-wrap: break-word;
+            /* Ensures text wraps within the cell */
+            min-width: 100px;
+            /* Example minimum width */
+        }
 
         th {
             background-color: #303030;
@@ -131,19 +135,20 @@
     <noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-NLRXDFCH" height="0" width="0"
             style="display:none;visibility:hidden"></iframe></noscript>
     <!-- End Google Tag Manager (noscript) -->
+
     <h1>Tracker for Undocumented Nostr Event Kinds</h1>
     <p>
-        This service samples events from the Nostr network and keeps track of kinds that are not documented by any NIPs
-        (Nostr Improvement Proposals). This can be useful for developers or researchers aiming to add a new kind and
-        want to choose a number that minimizes the chances of clashing with someone else exploring a new idea.
+        This service monitors undocumented event kinds in the Nostr network, aiding developers and researchers who are
+        looking to introduce new kinds without clashing with others. For programmatic access, use the <a
+            href="/json">JSON endpoint</a>.
     </p>
     <p>
-        Beyond its utility for avoiding clashes, this tracker offers a unique window into the innovative ways people are
-        engaging with the network. It's not just a tool for developers—it's also a fun way to discover emerging trends,
-        niche uses, and the creative ideas circulating within the Nostr community, even before they become formalized in
-        NIPs.
+        The tracker not only helps avoid clashes but also provides insights into the evolving use of the network,
+        revealing emerging trends and creative concepts before they're formalized in NIPs.
     </p>
-    <p><strong>Note:</strong> Kinds not seen for a month are removed from the list.</p>
+    <p><strong>Note:</strong> Kinds not observed for a month are removed from the list.</p>
+
+
 
     <div class="table-responsive">
         <table>
