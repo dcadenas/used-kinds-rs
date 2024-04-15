@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-const POPULAR_RELAYS: [&str; 4] = [
+const POPULAR_RELAYS_FALLBACK: [&str; 4] = [
     "wss://relay.damus.io",
     "wss://relay.primal.net",
     "wss://relay.n057r.club",
@@ -183,6 +183,30 @@ pub enum NostrActorMessage {
     HealthCheck,
 }
 
+async fn get_relays() -> impl Iterator<Item = String> {
+    let relays: Vec<String> = match reqwest::get("https://api.nostr.watch/v1/online").await {
+        Ok(response) => {
+            let mut relays: Vec<String> = response.json::<Vec<String>>().await.unwrap_or_default();
+            relays.truncate(5);
+
+            info!("Fetched relays from nostr.watch");
+            relays
+        }
+        Err(e) => {
+            let relays = POPULAR_RELAYS_FALLBACK
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+            error!("Failed to fetch relays from Nostr API: {}", e);
+            relays
+        }
+    };
+
+    info!("Relays: {:?}", relays);
+    return relays.into_iter();
+}
+
 #[ractor::async_trait]
 impl Actor for NostrActor {
     type Msg = NostrActorMessage;
@@ -202,7 +226,8 @@ impl Actor for NostrActor {
         let client = ClientBuilder::new().opts(opts).build();
 
         let opts = RelayOptions::default().ping(true);
-        for relay in POPULAR_RELAYS.into_iter() {
+
+        for relay in get_relays().await {
             client.add_relay_with_opts(relay, opts.clone()).await?;
         }
 

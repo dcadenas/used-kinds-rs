@@ -35,8 +35,6 @@ lazy_static! {
         env::var("STATS_FILE").unwrap_or_else(|_| "/var/data/stats.json".to_string());
 }
 
-// TODO: Currently pretty anemic to be an actor but can be refactored later
-// while learning the actor model and how it merges with an http axum server
 pub struct HttpActor;
 
 #[derive(Clone)]
@@ -51,6 +49,9 @@ pub struct HttpActorState {
 
 pub enum HttpActorMessage {}
 
+// TODO: Currently pretty anemic to be an actor but can be refactored later.
+// Conciously over-engineered to learn the actor model and how it merges with an
+// http axum server
 #[ractor::async_trait]
 impl Actor for HttpActor {
     type Msg = HttpActorMessage;

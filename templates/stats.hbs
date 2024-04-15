@@ -50,9 +50,8 @@
             text-align: left;
             border-bottom: 1px solid #333;
             word-wrap: break-word;
-            /* Ensures text wraps within the cell */
             min-width: 100px;
-            /* Example minimum width */
+            max-width: 68vw;
         }
 
         th {
@@ -82,7 +81,6 @@
             margin-top: 40px;
             text-align: center;
             color: #999;
-            /* Lighter text in footer for visibility */
         }
 
         @media (max-width: 1280px) {
@@ -240,7 +238,7 @@
                         const pre = document.createElement('pre');
                         const code = document.createElement('code');
                         code.className = 'json';
-                        code.textContent = jsonData; // Safely assigns text, escaping HTML and JS
+                        code.textContent = jsonData;
 
                         pre.appendChild(code);
                         detailCell.appendChild(pre);
