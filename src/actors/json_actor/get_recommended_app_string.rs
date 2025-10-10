@@ -1,25 +1,27 @@
 use anyhow::Result;
 use nostr_sdk::prelude::*;
+use serde_json::Value;
 
 pub fn parse_recommended_app(app_event: &Event) -> Result<(Box<[Kind]>, String)> {
-    let alt_tag_data = app_event.tags().iter().find_map(|tag| match tag {
-        Tag::Generic(TagKind::Custom(tag_name), data) if tag_name == "alt" && !data.is_empty() => {
-            data.first().cloned()
+    let alt_tag_data = app_event.tags.iter().find_map(|tag| {
+        // Look for alt tags using tag name
+        if tag.as_slice().first() == Some(&"alt".to_string()) {
+            return tag.as_slice().get(1).cloned();
         }
-        _ => None,
+        None
     });
 
     let kind_tag_data: Box<[Kind]> = app_event
-        .tags()
+        .tags
         .iter()
-        .filter_map(|tag| match tag {
-            Tag::Generic(TagKind::Custom(tag_name), data)
-                if tag_name == "k" && !data.is_empty() =>
-            {
-                data.first()
-                    .and_then(|kind_string| kind_string.parse::<u64>().ok().map(Kind::from))
+        .filter_map(|tag| {
+            // Look for k tags (single letter)
+            if tag.as_slice().first() == Some(&"k".to_string()) {
+                if let Some(kind_str) = tag.as_slice().get(1) {
+                    return kind_str.parse::<u16>().ok().map(Kind::from);
+                }
             }
-            _ => None,
+            None
         })
         .collect();
 

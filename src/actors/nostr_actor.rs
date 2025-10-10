@@ -6,6 +6,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use nostr_sdk::prelude::*;
 use ractor::{cast, concurrency::Duration, Actor, ActorProcessingErr, ActorRef, SupervisionEvent};
+use serde_json;
 use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -34,10 +35,12 @@ impl State {
         nostr_actor: &ActorRef<NostrActorMessage>,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
-        let filters = vec![Filter::new().limit(1)];
-        info!("Filter is {:?}", filters);
+        let filter = Filter::new().limit(1);
+        info!("Filter is {:?}", filter);
 
-        let main_sub_id = self.client.subscribe(filters.clone(), None).await;
+        let Output {
+            val: main_sub_id, ..
+        } = self.client.subscribe(filter.clone(), None).await?;
         info!("Main sub id is {}", main_sub_id);
         self.client
             .handle_notifications(|notification| async {
@@ -54,13 +57,13 @@ impl State {
                     } => {
                         cast!(
                             nostr_actor,
-                            NostrActorMessage::NewEvent(event, subscription_id, relay_url)
+                            NostrActorMessage::NewEvent(event, subscription_id, relay_url.into())
                         )?;
                         Ok(false)
                     }
                     RelayPoolNotification::Message { message, .. } => {
                         match message {
-                            RelayMessage::Notice { message, .. } => {
+                            RelayMessage::Notice(message) => {
                                 info!("Received notice: {:?}", message);
                             }
                             RelayMessage::Closed {
@@ -68,7 +71,7 @@ impl State {
                                 message,
                             } => {
                                 info!("Subscription {} closed: {}", subscription_id, message);
-                                if subscription_id == main_sub_id {
+                                if subscription_id.as_ref() == &main_sub_id {
                                     return Ok(true);
                                 }
                             }
@@ -83,14 +86,6 @@ impl State {
                         }
                         Ok(false)
                     }
-                    RelayPoolNotification::RelayStatus { relay_url, status } => {
-                        info!("Relay status: {:?} - {:?}", relay_url, status);
-                        Ok(false)
-                    }
-                    RelayPoolNotification::Stop => {
-                        info!("Stop");
-                        Ok(true)
-                    }
                     RelayPoolNotification::Shutdown => {
                         info!("Shutdown");
                         Ok(true)
@@ -103,19 +98,18 @@ impl State {
     }
 
     async fn subscribe_recommended_app_query(&mut self, kind: Kind) {
-        let filters = vec![Filter::new()
+        let filter = Filter::new()
             .limit(1)
-            .kind(Kind::ParameterizedReplaceable(31990))
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::K), [kind.to_string()])];
+            .kind(Kind::from_u16(31990))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::K), kind.to_string());
 
-        let opts = SubscribeAutoCloseOptions::default()
-            .timeout(Some(Duration::from_secs(5)))
-            .filter(FilterOptions::ExitOnEOSE);
+        let opts = SubscribeAutoCloseOptions::default().timeout(Some(Duration::from_secs(5)));
 
         let id = SubscriptionId::generate();
         self.subscription_ids.insert(id.clone(), ());
-        self.client
-            .subscribe_with_id(id.clone(), filters, Some(opts))
+        let _ = self
+            .client
+            .subscribe_with_id(id.clone(), filter, Some(opts))
             .await;
 
         if should_log() {
@@ -186,7 +180,8 @@ pub enum NostrActorMessage {
 async fn get_relays() -> impl Iterator<Item = String> {
     let relays: Vec<String> = match reqwest::get("https://api.nostr.watch/v1/online").await {
         Ok(response) => {
-            let mut relays: Vec<String> = response.json::<Vec<String>>().await.unwrap_or_default();
+            let text = response.text().await.unwrap_or_default();
+            let mut relays: Vec<String> = serde_json::from_str(&text).unwrap_or_default();
             relays.truncate(5);
 
             info!("Fetched relays from nostr.watch");
@@ -204,7 +199,7 @@ async fn get_relays() -> impl Iterator<Item = String> {
     };
 
     info!("Relays: {:?}", relays);
-    return relays.into_iter();
+    relays.into_iter()
 }
 
 #[ractor::async_trait]
@@ -218,17 +213,10 @@ impl Actor for NostrActor {
         myself: ActorRef<Self::Msg>,
         _arguments: (),
     ) -> Result<Self::State, ActorProcessingErr> {
-        let opts = Options::new()
-            .wait_for_send(false)
-            .connection_timeout(Some(Duration::from_secs(60)))
-            .wait_for_subscription(true);
-
-        let client = ClientBuilder::new().opts(opts).build();
-
-        let opts = RelayOptions::default().ping(true);
+        let client = Client::default();
 
         for relay in get_relays().await {
-            client.add_relay_with_opts(relay, opts.clone()).await?;
+            client.add_relay(relay).await?;
         }
 
         client.connect().await;
