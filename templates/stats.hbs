@@ -189,8 +189,14 @@
 
         .cards-container {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr));
-            gap: 0.625rem;
+            grid-template-columns: repeat(auto-fill, minmax(min(380px, 100%), 1fr));
+            gap: 1rem;
+        }
+
+        @media (min-width: 1400px) {
+            .cards-container {
+                grid-template-columns: repeat(3, 1fr);
+            }
         }
 
         .kind-card {
