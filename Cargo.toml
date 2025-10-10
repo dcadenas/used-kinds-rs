@@ -16,7 +16,7 @@ env_logger = "0.11.3"
 handlebars = "5.1.2"
 lazy_static = "1.4.0"
 log = "0.4.21"
-nostr-sdk = "0.30.0"
+nostr-sdk = "0.42"
 ractor = "0.9.7"
 reqwest = "0.12.3"
 serde = { version = "1.0.197", features = ["derive"] }

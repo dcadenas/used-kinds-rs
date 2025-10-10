@@ -1,16 +1,19 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 
 <head>
-<!-- Google tag (gtag.js) -->
-<script async src="https://www.googletagmanager.com/gtag/js?id=G-GSSMSPQCWR"></script>
-<script>
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){dataLayer.push(arguments);}
-  gtag('js', new Date());
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-  gtag('config', 'G-GSSMSPQCWR');
-</script>
+    <!-- Google tag (gtag.js) -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-GSSMSPQCWR"></script>
+    <script>
+        window.dataLayer = window.dataLayer || [];
+        function gtag() { dataLayer.push(arguments); }
+        gtag('js', new Date());
+        gtag('config', 'G-GSSMSPQCWR');
+    </script>
+
     <!-- Google Tag Manager -->
     <script>(function (w, d, s, l, i) {
             w[l] = w[l] || []; w[l].push({
@@ -20,246 +23,700 @@
                 j = d.createElement(s), dl = l != 'dataLayer' ? '&l=' + l : ''; j.async = true; j.src =
                     'https://www.googletagmanager.com/gtm.js?id=' + i + dl; f.parentNode.insertBefore(j, f);
         })(window, document, 'script', 'dataLayer', 'GTM-NLRXDFCH');</script>
-    <!-- End Google Tag Manager -->
-    <link rel="stylesheet"
-        href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css">
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap" rel="stylesheet">
 
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-    <title>Tracker for Undocumented Nostr Event Kinds</title>
+
+    <title>Undocumented Nostr Event Kinds Tracker</title>
+
     <style>
+        :root {
+            --bg-primary: #0f1419;
+            --bg-secondary: #1a1f2e;
+            --bg-tertiary: #252d3d;
+            --bg-hover: #2a3342;
+            --text-primary: #e7edf4;
+            --text-secondary: #8b96a5;
+            --text-tertiary: #6b7785;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --accent-light: #1e3a8a;
+            --border: #2d3748;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --purple: #8b5cf6;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
         body {
-            font-family: Roboto, 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            font-size: 18px;
-            margin: 0 15%;
-            background-color: #121212;
-            color: #e0e0e0;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 1.5rem 1rem;
+        }
+
+        header {
+            margin-bottom: 2rem;
         }
 
         h1 {
-            color: #e0e0e0;
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 1rem;
+            background: linear-gradient(135deg, var(--accent) 0%, var(--purple) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
         }
 
-        table {
-            overflow-x: auto;
-            width: 100%;
-            border-collapse: collapse;
-            table-layout: auto;
-            margin-top: 20px;
-            box-shadow: 0 2px 4px rgba(255, 255, 255, 0.1);
-            background-color: #1e1e1e;
-            color: #e0e0e0;
+        .description {
+            font-size: 1rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+            max-width: 800px;
         }
 
-        th,
-        td {
-            padding: 12px 15px;
-            text-align: left;
-            border-bottom: 1px solid #333;
-            word-wrap: break-word;
-            min-width: 100px;
-            max-width: 68vw;
-        }
-
-        th {
-            background-color: #303030;
-            color: #ffffff;
-            text-transform: uppercase;
-        }
-
-        tr:nth-child(even) {
-            background-color: #262626;
-        }
-
-        tr:hover {
-            background-color: #333333;
-        }
-
-        a {
-            color: #1e90ff;
+        .description a {
+            color: var(--accent);
             text-decoration: none;
+            font-weight: 500;
         }
 
-        a:hover {
+        .description a:hover {
             text-decoration: underline;
         }
 
-        .footer {
-            margin-top: 40px;
-            text-align: center;
-            color: #999;
+        .note {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: var(--bg-secondary);
+            padding: 0.75rem 1rem;
+            border-radius: 0.5rem;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            margin-top: 1rem;
+            border-left: 3px solid var(--warning);
         }
 
-        @media (max-width: 1280px) {
-            body {
-                margin: 20px;
-                font-family: Roboto, 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                font-size: 18px;
-                background-color: #121212;
-                color: #e0e0e0;
-            }
+        .search-container {
+            margin-bottom: 2rem;
+            position: sticky;
+            top: 1rem;
+            z-index: 100;
+            background: var(--bg-primary);
+            padding: 1rem 0;
+        }
+
+        .search-box {
+            position: relative;
+            max-width: 500px;
+        }
+
+        .search-box input {
+            width: 100%;
+            padding: 0.875rem 1rem 0.875rem 3rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 0.75rem;
+            color: var(--text-primary);
+            font-size: 0.9375rem;
+            transition: all 0.2s;
+        }
+
+        .search-box input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-light);
+        }
+
+        .search-box i {
+            position: absolute;
+            left: 1rem;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-tertiary);
+        }
+
+        .controls {
+            display: flex;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+            margin-top: 1rem;
+        }
+
+        .sort-button {
+            padding: 0.625rem 1rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            transition: all 0.2s;
+        }
+
+        .sort-button:hover {
+            background: var(--bg-hover);
+            color: var(--text-primary);
+        }
+
+        .sort-button.active {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+
+        .cards-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr));
+            gap: 0.625rem;
+        }
+
+        .kind-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+            padding: 0.625rem 0.75rem;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            cursor: pointer;
+            min-width: 0;
+            overflow: hidden;
+        }
+
+        .kind-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.3);
+            border-color: var(--accent);
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 0.5rem;
+        }
+
+        .kind-number {
+            font-size: 1.125rem;
+            font-weight: 700;
+            color: var(--accent);
+        }
+
+        .expand-icon {
+            color: var(--text-tertiary);
+            transition: transform 0.3s;
+        }
+
+        .kind-card.expanded .expand-icon {
+            transform: rotate(180deg);
+        }
+
+        .card-body {
+            display: flex;
+            flex-direction: column;
+            gap: 0.375rem;
+        }
+
+        .info-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.75rem;
+        }
+
+        .info-label {
+            color: var(--text-tertiary);
+            min-width: 60px;
+            font-size: 0.6875rem;
+        }
+
+        .info-value {
+            color: var(--text-secondary);
+            flex: 1;
+        }
+
+        .app-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.375rem;
+            padding: 0.25rem 0.75rem;
+            background: var(--bg-tertiary);
+            border-radius: 1rem;
+            font-size: 0.8125rem;
+            color: var(--success);
+            font-weight: 500;
+        }
+
+        .event-id {
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 0.8125rem;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            min-width: 0;
+        }
+
+        .event-id span {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .copy-btn {
+            padding: 0.25rem 0.5rem;
+            background: var(--bg-tertiary);
+            border: none;
+            border-radius: 0.375rem;
+            color: var(--text-tertiary);
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .copy-btn:hover {
+            background: var(--bg-hover);
+            color: var(--text-primary);
+        }
+
+        .count-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.25rem 0.625rem;
+            background: var(--accent-light);
+            border-radius: 0.375rem;
+            font-size: 0.8125rem;
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        .time-ago {
+            color: var(--text-tertiary);
+            font-size: 0.8125rem;
         }
 
         .json-content {
-            background-color: #262626;
-            /* Adjusting for dark mode */
-            border: 1px solid #333;
-            color: #e0e0e0;
-            /* Text color for readability */
+            margin-top: 0.75rem;
+            padding: 0;
+            background: var(--bg-primary);
+            border-radius: 0.375rem;
+            border: 1px solid var(--border);
+            max-height: 0;
+            overflow: hidden;
+            opacity: 0;
+            transition: all 0.3s ease;
         }
 
-        .toggle-indicator {
-            cursor: pointer;
+        .kind-card.expanded .json-content {
+            max-height: 400px;
+            padding: 0.75rem;
+            overflow-y: auto;
+            overflow-x: auto;
+            opacity: 1;
         }
 
-        th {
-            cursor: pointer;
+        .json-content pre {
+            margin: 0;
+            font-size: 0.75rem;
+            white-space: pre;
+            word-break: normal;
+            overflow-wrap: normal;
         }
 
-        .sort-indicator {
-            margin-left: 5px;
+        .json-content code {
+            font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
+            display: block;
+        }
+
+        .github-link {
+            color: var(--text-secondary);
+            text-decoration: none;
+            transition: color 0.2s;
+        }
+
+        .github-link:hover {
+            color: var(--accent);
+        }
+
+        footer {
+            margin-top: 4rem;
+            padding: 2rem 0;
+            border-top: 1px solid var(--border);
+            text-align: center;
+            color: var(--text-tertiary);
+        }
+
+        footer a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        footer a:hover {
+            text-decoration: underline;
+        }
+
+        .no-results {
+            text-align: center;
+            padding: 3rem;
+            color: var(--text-tertiary);
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 0.625rem;
+            }
+
+            h1 {
+                font-size: 1.25rem;
+            }
+
+            .description {
+                font-size: 0.875rem;
+            }
+
+            .cards-container {
+                grid-template-columns: 1fr;
+                gap: 0.5rem;
+            }
+
+            .kind-card {
+                padding: 0.5rem 0.625rem;
+            }
+
+            .search-box {
+                max-width: 100%;
+            }
+
+            .search-box input {
+                padding: 0.75rem 1rem 0.75rem 2.75rem;
+                font-size: 0.875rem;
+            }
+
+            .controls {
+                gap: 0.5rem;
+            }
+
+            .sort-button {
+                padding: 0.5rem 0.75rem;
+                font-size: 0.8125rem;
+            }
+
+            .kind-number {
+                font-size: 1rem;
+            }
+
+            .info-row {
+                font-size: 0.6875rem;
+            }
+
+            .info-label {
+                min-width: 50px;
+                font-size: 0.625rem;
+            }
+
+            .count-badge, .app-badge {
+                font-size: 0.6875rem;
+                padding: 0.1875rem 0.5rem;
+            }
+
+            .time-ago {
+                font-size: 0.6875rem;
+            }
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .kind-card {
+            animation: fadeIn 0.3s ease;
         }
 
         .hidden {
-            display: none;
+            display: none !important;
+        }
+
+        /* Scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 10px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--bg-tertiary);
+            border-radius: 5px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--bg-hover);
         }
     </style>
-
 </head>
 
 <body>
     <!-- Google Tag Manager (noscript) -->
     <noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-NLRXDFCH" height="0" width="0"
             style="display:none;visibility:hidden"></iframe></noscript>
-    <!-- End Google Tag Manager (noscript) -->
-    <h1>Tracker for Undocumented Nostr Event Kinds</h1>
-    <p>
-        This service monitors undocumented event kinds in the Nostr network, aiding developers and researchers who are
-        looking to introduce new kinds without clashing with others. For programmatic access, use the <a
-            href="/json">JSON endpoint</a>.
-    </p>
-    <p>
-        The tracker not only helps avoid clashes but also provides insights into the evolving use of the network,
-        revealing emerging trends and creative concepts before they're formalized in NIPs.
-    </p>
-    <p><strong>Note:</strong> Kinds not observed for a month are removed from the list.</p>
 
+    <div class="container">
+        <header>
+            <h1><i class="fas fa-chart-network"></i> Undocumented Nostr Event Kinds Tracker</h1>
+            <p class="description">
+                Monitor undocumented event kinds in the Nostr network. Perfect for developers and researchers looking to introduce new kinds without clashing with others.
+                For programmatic access, use the <a href="/json">JSON endpoint</a>.
+            </p>
+            <p class="description">
+                Track emerging trends and creative concepts before they're formalized in NIPs.
+            </p>
+            <div class="note">
+                <i class="fas fa-info-circle"></i>
+                <span><strong>Note:</strong> Kinds not observed for a month are removed from the list.</span>
+            </div>
+        </header>
 
+        <div class="search-container">
+            <div class="search-box">
+                <i class="fas fa-search"></i>
+                <input type="text" id="searchInput" placeholder="Search by kind number, recommended app, or event ID...">
+            </div>
+            <div class="controls">
+                <button class="sort-button active" data-sort="kind">
+                    <i class="fas fa-sort-numeric-down"></i>
+                    <span>Sort by Kind</span>
+                </button>
+                <button class="sort-button" data-sort="count">
+                    <i class="fas fa-chart-bar"></i>
+                    <span>Sort by Count</span>
+                </button>
+                <button class="sort-button" data-sort="time">
+                    <i class="fas fa-clock"></i>
+                    <span>Sort by Time</span>
+                </button>
+            </div>
+        </div>
 
-    <div>
-        <table>
-            <thead>
-                <tr>
-                    <th>Kind <span class="sort-indicator"></span></th>
-                    <th>Recommended App <span class="sort-indicator"></span></th>
-                    <th>Latest Event Sampled <span class="sort-indicator"></span></th>
-                    <th>Seen Times <span class="sort-indicator"></span></th>
-                    <th>Last Seen At <span class="sort-indicator"></span></th>
-                    <th class="hidden"></th>
-                </tr>
-            </thead>
-            <tbody>
-                {{#each stats}}
-                <tr class="row-toggle" data-event-json='{{json this.[1].event}}'>
-                    <td> <a
-                            href="https://github.com/search?q=repo%3Anostr-protocol%2Fnips++%2Fkind.*%5Cb{{this.[0]}}%5Cb%2F&type=code">{{this.[0]}}</a>
-                    </td>
-                    <td>{{this.[1].recommended_app}}</td>
-                    <td class="toggle-indicator">
-                        <span><i class="fas fa-chevron-down"></i></span>
-                        <a href="#" class="event-link">{{ellipsis this.[1].event.id 20}}</a>
-                    </td>
-                    <td>{{this.[1].count}}</td>
-                    <td>{{date_relative this.[1].last_updated}}</td>
-                    <td class="hidden">{{this.[1].last_updated }}</td>
-                </tr>
-                {{/each}}
-            </tbody>
-        </table>
-    </div>
-    <div class="footer">
-        <p>For feedback or inquiries, feel free to reach out at Nostr:</p>
-        <p><a href="nop: daniel@nos.social" style="color: #007bff; text-decoration: none;"><i
-                    class="fas fa-paper-plane"></i> daniel@nos.social</a></p>
+        <div class="cards-container" id="cardsContainer">
+            {{#each stats}}
+            <div class="kind-card" data-kind="{{this.[0]}}" data-count="{{this.[1].count}}" data-time="{{this.[1].last_updated}}" data-app="{{this.[1].recommended_app}}" data-event="{{this.[1].event.id}}">
+                <div class="card-header">
+                    <div class="kind-number">
+                        <a href="https://github.com/search?q=repo%3Anostr-protocol%2Fnips++%2Fkind.*%5Cb{{this.[0]}}%5Cb%2F&type=code"
+                           class="github-link" target="_blank" title="Search in NIPs">
+                            #{{this.[0]}}
+                        </a>
+                    </div>
+                    <i class="fas fa-chevron-down expand-icon"></i>
+                </div>
+                <div class="card-body">
+                    {{#if this.[1].recommended_app}}
+                    <div class="info-row">
+                        <span class="info-label">App</span>
+                        <span class="app-badge">
+                            <i class="fas fa-check-circle"></i>
+                            {{this.[1].recommended_app}}
+                        </span>
+                    </div>
+                    {{/if}}
+                    <div class="info-row">
+                        <span class="info-label">Event ID</span>
+                        <div class="event-id">
+                            <span>{{ellipsis this.[1].event.id 16}}</span>
+                            <button class="copy-btn" data-copy="{{this.[1].event.id}}" title="Copy full event ID">
+                                <i class="fas fa-copy"></i>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Seen</span>
+                        <span class="count-badge">{{this.[1].count}}x</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Last seen</span>
+                        <span class="time-ago">{{date_relative this.[1].last_updated}}</span>
+                    </div>
+                </div>
+                <div class="json-content">
+                    <pre><code class="json">{{json this.[1].event}}</code></pre>
+                </div>
+            </div>
+            {{/each}}
+        </div>
+
+        <div class="no-results hidden" id="noResults">
+            <i class="fas fa-search" style="font-size: 3rem; margin-bottom: 1rem; opacity: 0.3;"></i>
+            <p>No kinds found matching your search.</p>
+        </div>
+
+        <footer>
+            <p>For feedback or inquiries, reach out at Nostr:</p>
+            <p><a href="nostr:daniel@nos.social"><i class="fas fa-paper-plane"></i> daniel@nos.social</a></p>
+        </footer>
     </div>
 
     <script>
-
-
         document.addEventListener('DOMContentLoaded', () => {
-            const getCellValue = (tr, idx) => tr.children[idx] ? tr.children[idx].innerText || tr.children[idx].textContent : '';
-            const comparer = (idx, asc) => (a, b) => ((v1, v2) =>
-                v1 !== '' && v2 !== '' && !isNaN(v1) && !isNaN(v2) ? v1 - v2 : v1.toString().localeCompare(v2)
-            )(getCellValue(asc ? a : b, idx), getCellValue(asc ? b : a, idx));
+            const searchInput = document.getElementById('searchInput');
+            const cardsContainer = document.getElementById('cardsContainer');
+            const noResults = document.getElementById('noResults');
+            const cards = Array.from(document.querySelectorAll('.kind-card'));
+            const sortButtons = document.querySelectorAll('.sort-button');
 
-            document.querySelectorAll('th').forEach(th => {
-                let indicator = th.querySelector('.sort-indicator');
-                th.addEventListener('click', function () {
-                    const table = th.closest('table');
-                    const tbody = table.querySelector('tbody');
+            let currentSort = 'kind';
+            let ascending = true;
 
-
-                    const jsonRows = tbody.querySelectorAll('.json-display-row');
-                    jsonRows.forEach(row => {
-                        row.remove();
-                    });
-
-                    let index = Array.from(th.parentNode.children).indexOf(th);
-
-                    if (index === 4) {
-                        index = 5;
+            // Decode base64 JSON
+            cards.forEach(card => {
+                const jsonContent = card.querySelector('.json-content code');
+                if (jsonContent) {
+                    try {
+                        const decoded = atob(jsonContent.textContent);
+                        jsonContent.textContent = decoded;
+                    } catch (e) {
+                        console.error('Failed to decode JSON:', e);
                     }
-
-                    Array.from(tbody.querySelectorAll('tr'))
-                        .sort(comparer(index, this.asc = !this.asc))
-                        .forEach(tr => tbody.appendChild(tr));
-
-                    document.querySelectorAll('.sort-indicator').forEach(indicator => {
-                        indicator.textContent = '';
-                    });
-
-                    indicator.textContent = this.asc ? '↑' : '↓';
-                });
+                }
             });
 
+            // Highlight all code blocks
             document.querySelectorAll('pre code').forEach((block) => {
                 hljs.highlightElement(block);
             });
 
-            document.querySelectorAll('.row-toggle .toggle-indicator').forEach(toggle => {
-                toggle.addEventListener('click', (event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    const row = toggle.closest('.row-toggle');
-                    let nextRow = row.nextElementSibling;
-                    const jsonData = atob(row.getAttribute('data-event-json'));
-
-                    if (nextRow && nextRow.classList.contains('json-display-row')) {
-                        nextRow.style.display = nextRow.style.display === 'none' ? '' : 'none';
-                    } else {
-                        const detailRow = document.createElement('tr');
-                        detailRow.className = 'json-display-row';
-                        const detailCell = document.createElement('td');
-                        detailCell.colSpan = 6;
-                        detailCell.classList.add('json-content');
-                        const pre = document.createElement('pre');
-                        const code = document.createElement('code');
-                        code.className = 'json';
-                        code.textContent = jsonData;
-
-                        pre.appendChild(code);
-                        detailCell.appendChild(pre);
-
-                        detailRow.appendChild(detailCell);
-                        row.parentNode.insertBefore(detailRow, nextRow);
-
-                        hljs.highlightElement(detailCell.querySelector('code'));
+            // Card expansion
+            cards.forEach(card => {
+                const header = card.querySelector('.card-header');
+                header.addEventListener('click', (e) => {
+                    if (!e.target.closest('a')) {
+                        card.classList.toggle('expanded');
                     }
                 });
             });
 
+            // Copy functionality
+            document.querySelectorAll('.copy-btn').forEach(btn => {
+                btn.addEventListener('click', async (e) => {
+                    e.stopPropagation();
+                    const text = btn.dataset.copy;
+                    try {
+                        await navigator.clipboard.writeText(text);
+                        const icon = btn.querySelector('i');
+                        icon.className = 'fas fa-check';
+                        setTimeout(() => {
+                            icon.className = 'fas fa-copy';
+                        }, 2000);
+                    } catch (err) {
+                        console.error('Failed to copy:', err);
+                    }
+                });
+            });
+
+            // Search functionality
+            searchInput.addEventListener('input', (e) => {
+                const query = e.target.value.toLowerCase().trim();
+                let visibleCount = 0;
+
+                cards.forEach(card => {
+                    const kind = card.dataset.kind.toLowerCase();
+                    const app = (card.dataset.app || '').toLowerCase();
+                    const eventId = (card.dataset.event || '').toLowerCase();
+
+                    const matches = kind.includes(query) ||
+                                  app.includes(query) ||
+                                  eventId.includes(query);
+
+                    if (matches) {
+                        card.style.display = '';
+                        visibleCount++;
+                    } else {
+                        card.style.display = 'none';
+                    }
+                });
+
+                if (visibleCount === 0) {
+                    noResults.classList.remove('hidden');
+                    cardsContainer.style.display = 'none';
+                } else {
+                    noResults.classList.add('hidden');
+                    cardsContainer.style.display = 'grid';
+                }
+            });
+
+            // Sort functionality
+            function sortCards(sortBy) {
+                const sortedCards = [...cards].sort((a, b) => {
+                    let aVal, bVal;
+
+                    switch(sortBy) {
+                        case 'kind':
+                            aVal = parseInt(a.dataset.kind);
+                            bVal = parseInt(b.dataset.kind);
+                            break;
+                        case 'count':
+                            aVal = parseInt(a.dataset.count);
+                            bVal = parseInt(b.dataset.count);
+                            break;
+                        case 'time':
+                            aVal = parseInt(a.dataset.time);
+                            bVal = parseInt(b.dataset.time);
+                            break;
+                    }
+
+                    return ascending ? aVal - bVal : bVal - aVal;
+                });
+
+                sortedCards.forEach(card => cardsContainer.appendChild(card));
+            }
+
+            sortButtons.forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const sortBy = btn.dataset.sort;
+
+                    if (currentSort === sortBy) {
+                        ascending = !ascending;
+                    } else {
+                        currentSort = sortBy;
+                        ascending = sortBy === 'kind' ? true : false;
+                    }
+
+                    sortButtons.forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+
+                    sortCards(sortBy);
+                });
+            });
+
+            // Initial sort by kind
+            sortCards('kind');
         });
     </script>
 </body>

@@ -30,6 +30,7 @@ pub enum JsonActorMessage {
     RecordEvent(Box<Event>, Url),
     RecordRecommendedApp(Box<Event>, Url),
     SaveState,
+    CleanupDocumentedKinds,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -99,6 +100,9 @@ impl Actor for JsonActor {
         kind_stats.retain(|kind, entry| !is_old(entry.last_updated) && is_kind_free(*kind));
 
         myself.send_interval(Duration::from_secs(60), || JsonActorMessage::SaveState);
+        myself.send_interval(Duration::from_secs(60 * 60 * 6), || {
+            JsonActorMessage::CleanupDocumentedKinds
+        });
         let (http_actor, _) = Actor::spawn_linked(
             Some("HttpActor".to_string()),
             HttpActor,
@@ -211,6 +215,24 @@ impl Actor for JsonActor {
                     if let Err(e) = reply.send(data_as_sorted_vec) {
                         error!("Error when sending sorted vec: {}", e);
                     }
+                }
+            }
+            JsonActorMessage::CleanupDocumentedKinds => {
+                let before_count = state.kind_stats.len();
+                state.kind_stats.retain(|kind, _| is_kind_free(*kind));
+                let after_count = state.kind_stats.len();
+                let removed_count = before_count - after_count;
+
+                if removed_count > 0 {
+                    info!(
+                        "Cleaned up {} newly-documented kinds from stats (was {}, now {})",
+                        removed_count, before_count, after_count
+                    );
+                    if let Err(e) = save_stats_to_json(&state.kind_stats).await {
+                        error!("Failed to save stats after cleanup: {}", e);
+                    }
+                } else {
+                    info!("No newly-documented kinds to clean up");
                 }
             }
         }
