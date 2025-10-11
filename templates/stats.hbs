@@ -600,30 +600,33 @@
             let currentSort = 'kind';
             let ascending = true;
 
-            // Decode base64 JSON
-            cards.forEach(card => {
+            // Lazy decode and highlight JSON only when card is expanded
+            function decodeAndHighlightCard(card) {
                 const jsonContent = card.querySelector('.json-content code');
-                if (jsonContent) {
+                if (jsonContent && !card.dataset.decoded) {
                     try {
                         const decoded = atob(jsonContent.textContent);
                         jsonContent.textContent = decoded;
+                        hljs.highlightElement(jsonContent);
+                        card.dataset.decoded = 'true';
                     } catch (e) {
                         console.error('Failed to decode JSON:', e);
                     }
                 }
-            });
+            }
 
-            // Highlight all code blocks
-            document.querySelectorAll('pre code').forEach((block) => {
-                hljs.highlightElement(block);
-            });
-
-            // Card expansion
+            // Card expansion with lazy loading
             cards.forEach(card => {
                 const header = card.querySelector('.card-header');
                 header.addEventListener('click', (e) => {
                     if (!e.target.closest('a')) {
+                        const wasExpanded = card.classList.contains('expanded');
                         card.classList.toggle('expanded');
+
+                        // Only decode/highlight when expanding (not collapsing)
+                        if (!wasExpanded) {
+                            decodeAndHighlightCard(card);
+                        }
                     }
                 });
             });
