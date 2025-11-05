@@ -37,15 +37,15 @@ pub enum JsonActorMessage {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct KindEntry {
-    event: Event,
-    count: u64,
-    last_updated: i64,
-    recommended_app: Option<String>,
-    recommended_app_event: Option<Event>,
+    pub event: Event,
+    pub count: u64,
+    pub last_updated: i64,
+    pub recommended_app: Option<String>,
+    pub recommended_app_event: Option<Event>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cluster_id: Option<u32>,
+    pub cluster_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cluster_similarity: Option<f64>,
+    pub cluster_similarity: Option<f64>,
 }
 
 pub struct State {
@@ -54,6 +54,7 @@ pub struct State {
     nostr_actor: ActorRef<NostrActorMessage>,
     recommended_apps: HashMap<Kind, Timestamp>,
     clustering_in_progress: bool,
+    qdrant_client: Option<qdrant_client::Qdrant>,
 }
 
 impl State {
@@ -77,6 +78,60 @@ impl State {
 
 fn is_old(unix_time: i64) -> bool {
     unix_time < (Utc::now() - chrono::Duration::days(30)).timestamp_millis()
+}
+
+/// Query all events from Qdrant
+async fn query_all_from_qdrant(client: &qdrant_client::Qdrant) -> Result<Vec<(Kind, KindEntry)>> {
+    use qdrant_client::qdrant::ScrollPointsBuilder;
+
+    let collection = crate::qdrant_client::collection_name();
+    let mut results = Vec::new();
+    let mut offset: Option<qdrant_client::qdrant::PointId> = None;
+
+    // Scroll through all points (paginated)
+    loop {
+        let mut scroll_builder = ScrollPointsBuilder::new(collection)
+            .with_payload(true)
+            .limit(100);
+
+        if let Some(offset_id) = offset {
+            scroll_builder = scroll_builder.offset(offset_id);
+        }
+
+        let response = client.scroll(scroll_builder.build()).await?;
+
+        for point in &response.result {
+            let kind_num = point.id.as_ref().and_then(|id| {
+                if let qdrant_client::qdrant::point_id::PointIdOptions::Num(n) = id.point_id_options.as_ref()? {
+                    Some(*n as u16)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(kind_num) = kind_num {
+                match crate::qdrant_client::payload_to_kind_entry(&point.payload) {
+                    Ok(entry) => {
+                        results.push((Kind::from(kind_num), entry));
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize kind {}: {}", kind_num, e);
+                    }
+                }
+            }
+        }
+
+        // Check if there are more results
+        offset = response.result.last().and_then(|p| p.id.clone());
+        if response.result.is_empty() || response.next_page_offset.is_none() {
+            break;
+        }
+    }
+
+    // Sort by kind number
+    results.sort_by_key(|(kind, _)| *kind);
+
+    Ok(results)
 }
 
 #[ractor::async_trait]
@@ -123,12 +178,33 @@ impl Actor for JsonActor {
         .await?;
         let recommended_apps = HashMap::new();
 
+        // Initialize Qdrant client (optional - graceful degradation if unavailable)
+        let qdrant_client = match crate::qdrant_client::initialize_qdrant().await {
+            Ok(client) => {
+                info!("Qdrant client initialized successfully");
+
+                // Migrate stats.json on first startup
+                match crate::qdrant_client::migrate_from_stats_json(&client, &*STATS_FILE).await {
+                    Ok(true) => info!("Completed one-time migration from stats.json to Qdrant"),
+                    Ok(false) => info!("No migration needed"),
+                    Err(e) => error!("Migration failed (continuing anyway): {}", e),
+                }
+
+                Some(client)
+            }
+            Err(e) => {
+                error!("Failed to initialize Qdrant client: {}. Continuing without Qdrant.", e);
+                None
+            }
+        };
+
         let state = State {
             kind_stats,
             http_actor,
             nostr_actor,
             recommended_apps,
             clustering_in_progress: false,
+            qdrant_client,
         };
 
         Ok(state)
@@ -195,6 +271,50 @@ impl Actor for JsonActor {
                         cluster_similarity: None,
                     });
 
+                // Also upsert to Qdrant if available
+                if let Some(ref client) = state.qdrant_client {
+                    let kind_entry = state.kind_stats.get(&event.kind).unwrap();
+
+                    // Generate vector from event features
+                    let features = crate::similarity::EventFeatures::from_event(&event);
+                    let vector = features.to_vector();
+
+                    // Create payload from KindEntry
+                    use nostr_sdk::JsonUtil;
+
+                    let payload_json = serde_json::json!({
+                        "kind": u16::from(event.kind),
+                        "count": kind_entry.count,
+                        "last_updated": kind_entry.last_updated,
+                        "recommended_app": kind_entry.recommended_app,
+                        "event_id": event.id.to_string(),
+                        "event": event.as_json(),
+                    });
+
+                    // Convert to Qdrant Payload (from serde_json::Map)
+                    let payload = qdrant_client::Payload::from(
+                        payload_json.as_object().cloned().unwrap_or_default()
+                    );
+
+                    // Upsert to Qdrant (async, fire-and-forget to avoid blocking)
+                    let client_clone = client.clone();
+                    let kind_id = u16::from(event.kind) as u64;
+                    let collection = crate::qdrant_client::collection_name().to_string();
+
+                    tokio::spawn(async move {
+                        use qdrant_client::qdrant::{PointStruct, UpsertPointsBuilder};
+
+                        let point = PointStruct::new(kind_id, vector, payload);
+
+                        if let Err(e) = client_clone
+                            .upsert_points(UpsertPointsBuilder::new(collection, vec![point]).build())
+                            .await
+                        {
+                            error!("Failed to upsert to Qdrant: {}", e);
+                        }
+                    });
+                }
+
                 if let Err(e) = state.maybe_refresh_recommended_app(event.kind) {
                     error!("Failed to refresh recommended app: {}", e);
                 }
@@ -216,37 +336,90 @@ impl Actor for JsonActor {
                 save_stats_to_json(&state.kind_stats).await?;
             }
             JsonActorMessage::GetStatsVec(_arg, reply) => {
-                let mut data_as_sorted_vec: Vec<(Kind, KindEntry)> = state
-                    .kind_stats
-                    .clone()
-                    .into_iter()
-                    .filter(|(_, v)| !is_old(v.last_updated))
-                    .collect();
-
-                data_as_sorted_vec.sort_by_key(|(kind, _)| *kind);
                 if !reply.is_closed() {
-                    info!("Sending sorted vec");
+                    // Query Qdrant if available, otherwise fall back to HashMap
+                    let data_as_sorted_vec = if let Some(ref client) = state.qdrant_client {
+                        match query_all_from_qdrant(client).await {
+                            Ok(vec) => {
+                                info!("Sending {} events from Qdrant", vec.len());
+                                vec
+                            }
+                            Err(e) => {
+                                error!("Failed to query Qdrant, falling back to HashMap: {}", e);
+                                // Fallback to HashMap
+                                let mut vec: Vec<(Kind, KindEntry)> = state
+                                    .kind_stats
+                                    .clone()
+                                    .into_iter()
+                                    .filter(|(_, v)| !is_old(v.last_updated))
+                                    .collect();
+                                vec.sort_by_key(|(kind, _)| *kind);
+                                vec
+                            }
+                        }
+                    } else {
+                        // No Qdrant, use HashMap
+                        let mut vec: Vec<(Kind, KindEntry)> = state
+                            .kind_stats
+                            .clone()
+                            .into_iter()
+                            .filter(|(_, v)| !is_old(v.last_updated))
+                            .collect();
+                        vec.sort_by_key(|(kind, _)| *kind);
+                        vec
+                    };
+
                     if let Err(e) = reply.send(data_as_sorted_vec) {
                         error!("Error when sending sorted vec: {}", e);
                     }
                 }
             }
             JsonActorMessage::CleanupDocumentedKinds => {
-                let before_count = state.kind_stats.len();
-                state.kind_stats.retain(|kind, _| is_kind_free(*kind));
-                let after_count = state.kind_stats.len();
-                let removed_count = before_count - after_count;
+                // Collect kinds to remove (newly-documented + old events)
+                let kinds_to_remove: Vec<Kind> = state
+                    .kind_stats
+                    .iter()
+                    .filter(|(kind, entry)| !is_kind_free(**kind) || is_old(entry.last_updated))
+                    .map(|(kind, _)| *kind)
+                    .collect();
 
-                if removed_count > 0 {
-                    info!(
-                        "Cleaned up {} newly-documented kinds from stats (was {}, now {})",
-                        removed_count, before_count, after_count
-                    );
+                if !kinds_to_remove.is_empty() {
+                    info!("Cleaning up {} kinds (documented or old)", kinds_to_remove.len());
+
+                    // Remove from HashMap
+                    for kind in &kinds_to_remove {
+                        state.kind_stats.remove(kind);
+                    }
+
+                    // Also delete from Qdrant
+                    if let Some(ref client) = state.qdrant_client {
+                        let client_clone = client.clone();
+                        let collection = crate::qdrant_client::collection_name().to_string();
+                        let point_ids: Vec<u64> = kinds_to_remove
+                            .iter()
+                            .map(|k| u16::from(*k) as u64)
+                            .collect();
+
+                        tokio::spawn(async move {
+                            use qdrant_client::qdrant::DeletePointsBuilder;
+
+                            let delete_request = DeletePointsBuilder::new(collection)
+                                .points(point_ids)
+                                .build();
+
+                            if let Err(e) = client_clone.delete_points(delete_request).await {
+                                error!("Failed to delete points from Qdrant: {}", e);
+                            } else {
+                                info!("Deleted {} points from Qdrant", kinds_to_remove.len());
+                            }
+                        });
+                    }
+
                     if let Err(e) = save_stats_to_json(&state.kind_stats).await {
                         error!("Failed to save stats after cleanup: {}", e);
                     }
                 } else {
-                    info!("No newly-documented kinds to clean up");
+                    info!("No kinds to clean up");
                 }
             }
             JsonActorMessage::ComputeClusters => {

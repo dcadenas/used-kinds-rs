@@ -1,4 +1,4 @@
-use crate::normalization::{normalize_content, normalize_tags};
+use crate::normalization::{analyze_json_structure, normalize_content, normalize_tags};
 use nostr_sdk::prelude::*;
 use std::collections::{HashMap, HashSet};
 
@@ -82,10 +82,19 @@ impl EventFeatures {
         vector.push(if word_count > 50.0 && word_count <= 200.0 { 1.0 } else { 0.0 });
         vector.push(if word_count > 200.0 { 1.0 } else { 0.0 });
 
-        // JSON detection (content likely JSON)
-        let looks_like_json = self.normalized_content.trim().starts_with('{')
-            || self.normalized_content.trim().starts_with('[');
-        vector.push(if looks_like_json { 1.0 } else { 0.0 });
+        // Adaptive JSON structure features (10 dimensions)
+        let json_struct = analyze_json_structure(&self.normalized_content);
+
+        vector.push(if json_struct.is_valid_json { 1.0 } else { 0.0 });
+        vector.push(if json_struct.is_object { 1.0 } else { 0.0 });
+        vector.push(if json_struct.is_array { 1.0 } else { 0.0 });
+        vector.push((json_struct.top_level_key_count as f32 / 20.0).min(1.0)); // Normalized 0-20 keys
+        vector.push((json_struct.nested_key_count as f32 / 50.0).min(1.0)); // Normalized 0-50 nested keys
+        vector.push((json_struct.max_nesting_depth as f32 / 5.0).min(1.0)); // Normalized 0-5 depth
+        vector.push(if json_struct.has_arrays { 1.0 } else { 0.0 });
+        vector.push(json_struct.string_value_ratio);
+        vector.push(json_struct.number_value_ratio);
+        vector.push(json_struct.bool_value_ratio);
 
         // Padding to reach exactly 64 dimensions
         while vector.len() < crate::qdrant_client::vector_size() {
