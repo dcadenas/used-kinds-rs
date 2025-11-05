@@ -1,6 +1,9 @@
 mod actors;
 mod nips_fetcher;
+mod normalization;
+mod qdrant_client;
 mod service_manager;
+mod similarity;
 mod utils;
 
 use crate::actors::nostr_actor::NostrActor;
