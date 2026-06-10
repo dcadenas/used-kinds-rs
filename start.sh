@@ -1,7 +1,31 @@
 #!/usr/bin/env bash
 # Supervise qdrant + the app in one container (Render web services have no
 # sidecars). Exits when either process dies so the platform restarts the pair.
+# When QDRANT_URL points at another host (docker compose dev), there is no
+# qdrant to launch or supervise: wait for that one, then become the app.
 set -u
+
+# Parse host and port out of QDRANT_URL; scheme and path are optional.
+qdrant_url="${QDRANT_URL:-http://127.0.0.1:6334}"
+hostport="${qdrant_url#*://}"
+hostport="${hostport%%/*}"
+qdrant_host="${hostport%%:*}"
+qdrant_port="${hostport##*:}"
+if [ "$qdrant_port" = "$qdrant_host" ]; then
+    qdrant_port=6334
+fi
+
+if [ "$qdrant_host" != "127.0.0.1" ] && [ "$qdrant_host" != "localhost" ]; then
+    echo "Waiting for external qdrant at $qdrant_host:$qdrant_port"
+    for _ in $(seq 1 60); do
+        if (exec 3<>"/dev/tcp/$qdrant_host/$qdrant_port") 2>/dev/null; then
+            exec /used-kinds-rs
+        fi
+        sleep 1
+    done
+    echo "qdrant at $qdrant_host:$qdrant_port not ready after 60s, giving up" >&2
+    exit 1
+fi
 
 # exec so $! is qdrant itself, not a wrapper subshell
 (cd /qdrant && exec ./qdrant) &
