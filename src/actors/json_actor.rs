@@ -186,8 +186,114 @@ impl ClusteringSchedule {
 /// scored >= 0.95 and 112 below 0.9, so it separates same-codebase
 /// near-duplicates from coincidental similarity (at 0.8 about 92% of all
 /// kinds ended up clustered, which made the badge meaningless). v2 and v3
-/// showed the same valley.
+/// showed the same valley. (That calibration sampled the greedy seeds;
+/// the histogram now samples every point, so expect larger counts with
+/// the same valley shape.)
 const CLUSTER_SIMILARITY_THRESHOLD: f32 = 0.9;
+
+/// Union-find over sparse kind numbers (path halving, union by size).
+struct UnionFind {
+    parent: HashMap<u16, u16>,
+    size: HashMap<u16, usize>,
+}
+
+impl UnionFind {
+    fn new() -> Self {
+        Self {
+            parent: HashMap::new(),
+            size: HashMap::new(),
+        }
+    }
+
+    fn find(&mut self, x: u16) -> u16 {
+        let mut node = x;
+        loop {
+            let parent = *self.parent.entry(node).or_insert(node);
+            if parent == node {
+                return node;
+            }
+            let grandparent = *self.parent.entry(parent).or_insert(parent);
+            self.parent.insert(node, grandparent);
+            node = grandparent;
+        }
+    }
+
+    fn union(&mut self, a: u16, b: u16) {
+        let root_a = self.find(a);
+        let root_b = self.find(b);
+        if root_a == root_b {
+            return;
+        }
+        let size_a = *self.size.get(&root_a).unwrap_or(&1);
+        let size_b = *self.size.get(&root_b).unwrap_or(&1);
+        let (big, small) = if size_a >= size_b {
+            (root_a, root_b)
+        } else {
+            (root_b, root_a)
+        };
+        self.parent.insert(small, big);
+        self.size.insert(big, size_a + size_b);
+    }
+}
+
+/// Order-independent batch clustering over per-kind neighbor lists.
+///
+/// Clusters are the connected components of the threshold-filtered
+/// similarity graph (union-find), so membership cannot depend on
+/// iteration order — the previous greedy pass let a later seed steal
+/// members from an earlier cluster and orphan the remainder. The cluster
+/// id is the lowest member kind (the contract the incremental path
+/// assumes) and each member's similarity is its best in-cluster edge.
+fn build_clusters(
+    neighbor_lists: &[(u16, Vec<(u16, f32)>)],
+    threshold: f32,
+) -> HashMap<u16, (u16, f64)> {
+    let mut union_find = UnionFind::new();
+    let mut best_edge: HashMap<u16, f64> = HashMap::new();
+
+    for (kind, neighbors) in neighbor_lists {
+        for (neighbor, score) in neighbors {
+            if *score < threshold || neighbor == kind {
+                continue;
+            }
+            union_find.union(*kind, *neighbor);
+            let score = f64::from(*score);
+            for endpoint in [*kind, *neighbor] {
+                best_edge
+                    .entry(endpoint)
+                    .and_modify(|best| *best = best.max(score))
+                    .or_insert(score);
+            }
+        }
+    }
+
+    let mut components: HashMap<u16, Vec<u16>> = HashMap::new();
+    let members: Vec<u16> = best_edge.keys().copied().collect();
+    for member in members {
+        let root = union_find.find(member);
+        components.entry(root).or_default().push(member);
+    }
+
+    let mut clusters = HashMap::new();
+    for mut component in components.into_values() {
+        // Every edge has two endpoints, so components here always have at
+        // least two members; isolated kinds never enter best_edge.
+        if component.len() < 2 {
+            continue;
+        }
+        component.sort_unstable();
+        let cluster_id = component[0];
+        for member in component {
+            let similarity = best_edge
+                .get(&member)
+                .copied()
+                .unwrap_or_else(|| f64::from(threshold));
+            clusters.insert(member, (cluster_id, similarity));
+        }
+    }
+
+    clusters
+}
 
 /// Outcome of fetching a kind's stored point before an update.
 enum StoredPoint {
@@ -1013,7 +1119,7 @@ impl Actor for JsonActor {
                 // Spawn background task for clustering using Qdrant similarity search
                 tokio::spawn(async move {
                     use qdrant_client::qdrant::SearchPointsBuilder;
-                    use std::collections::{HashMap, HashSet};
+                    use std::collections::HashSet;
 
                     info!("Computing similarity clusters using Qdrant search...");
 
@@ -1036,8 +1142,10 @@ impl Actor for JsonActor {
 
                     info!("Found {} points to cluster", all_points.len());
 
-                    let mut clusters: HashMap<u16, (u16, f64)> = HashMap::new();
-                    let mut assigned_to_cluster: HashSet<u16> = HashSet::new();
+                    // Gather phase: every point's top neighbors and scores.
+                    // Clustering itself happens afterwards in build_clusters,
+                    // which is order-independent.
+                    let mut neighbor_lists: Vec<(u16, Vec<(u16, f32)>)> = Vec::new();
                     let mut best_scores: Vec<f32> = Vec::new();
 
                     // For each point, search for similar neighbors using Qdrant
@@ -1053,11 +1161,6 @@ impl Actor for JsonActor {
                         } else {
                             continue;
                         };
-
-                        // Skip if already assigned to a cluster
-                        if assigned_to_cluster.contains(&kind_id) {
-                            continue;
-                        }
 
                         // Get the vector for this point
                         let vector = if let Some(vectors) = &point.vectors {
@@ -1088,87 +1191,30 @@ impl Actor for JsonActor {
                             }
                         };
 
-                        // Filter out self (the search includes the query point itself)
-                        let neighbors: Vec<_> = similar_points
+                        // Collect neighbors (the search includes the query
+                        // point itself; drop it here).
+                        let neighbors: Vec<(u16, f32)> = similar_points
                             .iter()
-                            .filter(|sp| {
-                                sp.id
-                                    .as_ref()
-                                    .and_then(|id| {
-                                        if let Some(
-                                            qdrant_client::qdrant::point_id::PointIdOptions::Num(n),
-                                        ) = id.point_id_options.as_ref()
-                                        {
-                                            Some(*n as u16 != kind_id)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or(false)
-                            })
-                            .collect();
-
-                        if let Some(top) = neighbors.first() {
-                            best_scores.push(top.score);
-                        }
-
-                        let neighbors: Vec<_> = neighbors
-                            .into_iter()
-                            .filter(|sp| sp.score >= CLUSTER_SIMILARITY_THRESHOLD)
-                            .collect();
-
-                        // If we found at least 1 neighbor (excluding self), create a cluster
-                        if !neighbors.is_empty() {
-                            // Build cluster from ALL similar points (including self)
-                            let mut cluster_members: Vec<u16> = vec![kind_id]; // Start with self
-
-                            // Add all neighbors
-                            for sp in &neighbors {
-                                if let Some(id) = sp.id.as_ref() {
+                            .filter_map(|sp| {
+                                let neighbor = sp.id.as_ref().and_then(|id| {
                                     if let Some(
                                         qdrant_client::qdrant::point_id::PointIdOptions::Num(n),
                                     ) = id.point_id_options.as_ref()
                                     {
-                                        cluster_members.push(*n as u16);
+                                        Some(*n as u16)
+                                    } else {
+                                        None
                                     }
-                                }
-                            }
+                                })?;
+                                (neighbor != kind_id).then_some((neighbor, sp.score))
+                            })
+                            .collect();
 
-                            cluster_members.sort();
-
-                            // Use the lowest kind number as cluster ID
-                            let cluster_id = *cluster_members.first().unwrap();
-
-                            // Assign all members to this cluster
-                            for &member_kind in &cluster_members {
-                                // Find similarity score for this member
-                                let similarity = if member_kind == kind_id {
-                                    1.0 // Self always has perfect similarity
-                                } else {
-                                    neighbors.iter()
-                                        .find(|sp| {
-                                            sp.id.as_ref().and_then(|id| {
-                                                if let Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)) = id.point_id_options.as_ref() {
-                                                    Some(*n as u16 == member_kind)
-                                                } else {
-                                                    None
-                                                }
-                                            }).unwrap_or(false)
-                                        })
-                                        .map(|sp| sp.score as f64)
-                                        .unwrap_or(CLUSTER_SIMILARITY_THRESHOLD as f64)
-                                };
-
-                                clusters.insert(member_kind, (cluster_id, similarity));
-                                assigned_to_cluster.insert(member_kind);
-                            }
-
-                            info!(
-                                "Created cluster {} with {} members",
-                                cluster_id,
-                                cluster_members.len()
-                            );
+                        if let Some((_, top_score)) = neighbors.first() {
+                            best_scores.push(*top_score);
                         }
+
+                        neighbor_lists.push((kind_id, neighbors));
                     }
 
                     // Best-neighbor score distribution; use this to recalibrate
@@ -1190,22 +1236,11 @@ impl Actor for JsonActor {
                         histogram
                     );
 
-                    // Count cluster sizes to remove single-member clusters
-                    let mut cluster_sizes: HashMap<u16, usize> = HashMap::new();
-                    for (cluster_id, _) in clusters.values() {
-                        *cluster_sizes.entry(*cluster_id).or_insert(0) += 1;
-                    }
-
-                    // Filter out single-member clusters
-                    let filtered_clusters: HashMap<u16, (u16, f64)> = clusters
-                        .into_iter()
-                        .filter(|(_, (cluster_id, _))| {
-                            cluster_sizes
-                                .get(cluster_id)
-                                .map(|&size| size > 1)
-                                .unwrap_or(false)
-                        })
-                        .collect();
+                    // Clustering phase: order-independent union-find over the
+                    // threshold-filtered similarity graph. Singletons never
+                    // appear (isolated kinds have no qualifying edges).
+                    let filtered_clusters =
+                        build_clusters(&neighbor_lists, CLUSTER_SIMILARITY_THRESHOLD);
 
                     let cluster_count = filtered_clusters.len();
                     let unique_clusters = filtered_clusters
@@ -1367,6 +1402,74 @@ mod tests {
     }
 
     #[test]
+    fn test_build_clusters_groups_transitive_neighbors() {
+        // 1-2 and 2-3 pass the threshold: union-find merges all three even
+        // though 1 and 3 were never compared directly.
+        let lists = vec![
+            (1u16, vec![(2u16, 0.95f32)]),
+            (2u16, vec![(3u16, 0.95f32)]),
+            (3u16, vec![]),
+        ];
+        let clusters = build_clusters(&lists, 0.9);
+        assert_eq!(clusters.get(&1).map(|c| c.0), Some(1));
+        assert_eq!(clusters.get(&2).map(|c| c.0), Some(1));
+        assert_eq!(clusters.get(&3).map(|c| c.0), Some(1));
+    }
+
+    #[test]
+    fn test_build_clusters_does_not_orphan_members_greedy_style() {
+        // The greedy bug this replaces: seed 10 formed {10, 20}, then seed
+        // 30 stole 20, orphaning 10 into a filtered singleton. Union-find
+        // merges the overlap into one cluster instead.
+        let lists = vec![
+            (10u16, vec![(20u16, 0.92f32)]),
+            (30u16, vec![(20u16, 0.95f32)]),
+        ];
+        let clusters = build_clusters(&lists, 0.9);
+        assert_eq!(
+            clusters.get(&10).map(|c| c.0),
+            Some(10),
+            "kind 10 must stay clustered, not become an orphaned singleton"
+        );
+        assert_eq!(clusters.get(&20).map(|c| c.0), Some(10));
+        assert_eq!(clusters.get(&30).map(|c| c.0), Some(10));
+    }
+
+    #[test]
+    fn test_build_clusters_is_seed_order_independent() {
+        let forward = vec![
+            (10u16, vec![(20u16, 0.92f32)]),
+            (30u16, vec![(20u16, 0.95f32)]),
+            (40u16, vec![(50u16, 0.91f32)]),
+        ];
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        assert_eq!(
+            build_clusters(&forward, 0.9),
+            build_clusters(&reversed, 0.9),
+            "iteration order must not change cluster membership"
+        );
+    }
+
+    #[test]
+    fn test_build_clusters_ignores_below_threshold_and_isolated_kinds() {
+        let lists = vec![(1u16, vec![(2u16, 0.85f32)]), (7u16, vec![])];
+        assert!(
+            build_clusters(&lists, 0.9).is_empty(),
+            "below-threshold edges and isolated kinds form no clusters"
+        );
+    }
+
+    #[test]
+    fn test_build_clusters_uses_lowest_kind_as_id_and_best_edge_as_similarity() {
+        let lists = vec![(9u16, vec![(5u16, 0.93f32)])];
+        let clusters = build_clusters(&lists, 0.9);
+        let expected_similarity = 0.93f32 as f64;
+        assert_eq!(clusters.get(&5), Some(&(5u16, expected_similarity)));
+        assert_eq!(clusters.get(&9), Some(&(5u16, expected_similarity)));
+    }
+
+    #[test]
     fn test_clustering_schedule_starts_when_idle() {
         let mut schedule = ClusteringSchedule::default();
         assert!(schedule.request(), "idle schedule starts a run");
@@ -1453,7 +1556,7 @@ mod tests {
         let collection = crate::qdrant_client::collection_name();
 
         let keys = Keys::generate();
-        let unsigned = EventBuilder::new(Kind::from(64901u16), "x").build(keys.public_key());
+        let unsigned = EventBuilder::new(Kind::from(64895u16), "x").build(keys.public_key());
         let event = keys.sign_event(unsigned).await.unwrap();
 
         let seed = |kind: u64, app: &str| {
@@ -1479,7 +1582,7 @@ mod tests {
             .upsert_points(
                 UpsertPointsBuilder::new(
                     collection,
-                    vec![seed(64901, "None found"), seed(64902, "RealApp")],
+                    vec![seed(64895, "None found"), seed(64896, "RealApp")],
                 )
                 .build(),
             )
@@ -1493,7 +1596,7 @@ mod tests {
             .get_points(
                 GetPointsBuilder::new(
                     collection,
-                    vec![PointId::from(64901u64), PointId::from(64902u64)],
+                    vec![PointId::from(64895u64), PointId::from(64896u64)],
                 )
                 .with_payload(true)
                 .build(),
@@ -1509,7 +1612,7 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .map(String::from);
             match kind {
-                Some(64901) => {
+                Some(64895) => {
                     assert_eq!(app, None, "sentinel value must be deleted");
                     assert_eq!(
                         point.payload.get("count").and_then(|v| v.as_integer()),
@@ -1517,7 +1620,7 @@ mod tests {
                         "other payload keys must survive the scrub"
                     );
                 }
-                Some(64902) => assert_eq!(app.as_deref(), Some("RealApp")),
+                Some(64896) => assert_eq!(app.as_deref(), Some("RealApp")),
                 other => panic!("unexpected point in result: {other:?}"),
             }
         }
@@ -1525,7 +1628,7 @@ mod tests {
         client
             .delete_points(
                 DeletePointsBuilder::new(collection)
-                    .points(vec![PointId::from(64901u64), PointId::from(64902u64)])
+                    .points(vec![PointId::from(64895u64), PointId::from(64896u64)])
                     .build(),
             )
             .await
