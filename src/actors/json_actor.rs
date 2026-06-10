@@ -1046,6 +1046,109 @@ mod tests {
 
     #[tokio::test]
     #[ignore] // Only run when Qdrant is available locally
+    async fn test_revectorize_outdated_points_upgrades_old_versions() {
+        use nostr_sdk::JsonUtil;
+        use qdrant_client::qdrant::{
+            DeletePointsBuilder, GetPointsBuilder, PointId, PointStruct, UpsertPointsBuilder,
+        };
+
+        let client = crate::qdrant_client::initialize_qdrant().await.unwrap();
+        let collection = crate::qdrant_client::collection_name();
+
+        let keys = Keys::generate();
+        let unsigned =
+            EventBuilder::new(Kind::from(64903u16), "hello world").build(keys.public_key());
+        let event = keys.sign_event(unsigned).await.unwrap();
+
+        // A point written by an older featurizer: stale vector, old version,
+        // plus unrelated fields that the rebuild must preserve.
+        let payload = qdrant_client::Payload::from(
+            serde_json::json!({
+                "kind": 64903,
+                "count": 3,
+                "last_updated": 1,
+                "event_id": event.id.to_string(),
+                "event": event.as_json(),
+                "feature_version": 1,
+                "cluster_id": 7,
+            })
+            .as_object()
+            .cloned()
+            .unwrap(),
+        );
+        let mut stale_vector = vec![0.0f32; crate::qdrant_client::vector_size()];
+        stale_vector[1] = 1.0;
+        client
+            .upsert_points(
+                UpsertPointsBuilder::new(
+                    collection,
+                    vec![PointStruct::new(64903u64, stale_vector.clone(), payload)],
+                )
+                .build(),
+            )
+            .await
+            .unwrap();
+
+        let updated = revectorize_outdated_points(&client).await.unwrap();
+        assert!(updated >= 1, "the seeded point must be re-vectorized");
+
+        let got = client
+            .get_points(
+                GetPointsBuilder::new(collection, vec![PointId::from(64903u64)])
+                    .with_payload(true)
+                    .with_vectors(true)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let point = got.result.first().expect("seeded point exists");
+
+        assert_eq!(
+            point
+                .payload
+                .get("feature_version")
+                .and_then(|v| v.as_integer()),
+            Some(crate::similarity::FEATURE_VERSION)
+        );
+        assert_eq!(
+            point.payload.get("count").and_then(|v| v.as_integer()),
+            Some(3),
+            "rebuild must preserve unrelated payload fields"
+        );
+        assert_eq!(
+            point.payload.get("cluster_id").and_then(|v| v.as_integer()),
+            Some(7)
+        );
+
+        let expected = crate::similarity::EventFeatures::from_event(&event).to_vector();
+        let stored = point
+            .vectors
+            .as_ref()
+            .and_then(|v| match v.vectors_options.as_ref() {
+                Some(qdrant_client::qdrant::vectors_output::VectorsOptions::Vector(vec)) => {
+                    Some(vec.data.clone())
+                }
+                _ => None,
+            })
+            .expect("vector present");
+        assert_ne!(stored, stale_vector, "stale vector must be replaced");
+        assert_eq!(stored.len(), expected.len());
+        for (s, e) in stored.iter().zip(expected.iter()) {
+            assert!((s - e).abs() < 1e-6, "vector rebuilt from event JSON");
+        }
+
+        client
+            .delete_points(
+                DeletePointsBuilder::new(collection)
+                    .points(vec![PointId::from(64903u64)])
+                    .build(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Only run when Qdrant is available locally
     async fn test_apply_cluster_assignments_sets_new_and_clears_stale() {
         use qdrant_client::qdrant::{
             DeletePointsBuilder, GetPointsBuilder, PointId, PointStruct, UpsertPointsBuilder,

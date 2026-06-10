@@ -154,10 +154,8 @@ pub fn analyze_json_structure(content: &str) -> JsonStructure {
 }
 
 fn analyze_value_recursive(value: &Value, depth: usize, structure: &mut JsonStructure) {
-    // Track max depth
-    if depth > structure.max_nesting_depth {
-        structure.max_nesting_depth = depth;
-    }
+    // Track max depth of nested containers
+    update_max_nesting_depth(value, depth, structure);
 
     // Check for arrays
     check_for_arrays(value, structure);
@@ -173,6 +171,26 @@ fn analyze_value_recursive(value: &Value, depth: usize, structure: &mut JsonStru
         structure.number_value_ratio = type_counts[1] as f32 / total_values as f32;
         structure.bool_value_ratio = type_counts[2] as f32 / total_values as f32;
         structure.null_value_ratio = type_counts[3] as f32 / total_values as f32;
+    }
+}
+
+/// Depth of the deepest container: 0 for a flat root, +1 per nested
+/// object/array level. Scalars do not add depth.
+fn update_max_nesting_depth(value: &Value, depth: usize, structure: &mut JsonStructure) {
+    if depth > structure.max_nesting_depth {
+        structure.max_nesting_depth = depth;
+    }
+
+    let children: Box<dyn Iterator<Item = &Value>> = match value {
+        Value::Object(obj) => Box::new(obj.values()),
+        Value::Array(arr) => Box::new(arr.iter()),
+        _ => return,
+    };
+
+    for child in children {
+        if matches!(child, Value::Object(_) | Value::Array(_)) {
+            update_max_nesting_depth(child, depth + 1, structure);
+        }
     }
 }
 
@@ -262,6 +280,28 @@ mod tests {
         let content = "Visit https://example.com/path and http://test.org";
         let normalized = normalize_content(content);
         assert_eq!(normalized, "Visit <URL> and <URL>");
+    }
+
+    #[test]
+    fn test_max_nesting_depth_counts_container_levels() {
+        assert_eq!(
+            analyze_json_structure(r#"{"a":1,"b":"x"}"#).max_nesting_depth,
+            0,
+            "flat object has no nesting"
+        );
+        assert_eq!(
+            analyze_json_structure(r#"{"a":{"b":1}}"#).max_nesting_depth,
+            1
+        );
+        assert_eq!(
+            analyze_json_structure(r#"{"a":{"b":{"c":[1,2]}}}"#).max_nesting_depth,
+            3
+        );
+        assert_eq!(
+            analyze_json_structure(r#"[{"a":1}]"#).max_nesting_depth,
+            1,
+            "object inside root array is one level deep"
+        );
     }
 
     #[test]

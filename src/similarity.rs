@@ -7,7 +7,9 @@ use std::collections::{HashMap, HashSet};
 /// Stored in every Qdrant point payload; bump it whenever the vector layout
 /// or any feature computation changes so stored points get re-vectorized at
 /// startup. Mixing vectors from different schemes makes similarity garbage.
-pub const FEATURE_VERSION: i64 = 2;
+///
+/// v3: `max_nesting_depth` is computed for real (it was constantly 0 in v2).
+pub const FEATURE_VERSION: i64 = 3;
 
 // 64-dim vector layout. Each family is normalized to unit energy before the
 // global normalization so no family can drown the others.
