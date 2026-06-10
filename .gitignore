@@ -1,2 +1,6 @@
 /target
 stats.json
+qdrant_storage/
+nips_kinds_cache.json
+.DS_Store
+.plandex/

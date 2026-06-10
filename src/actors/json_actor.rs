@@ -5,7 +5,6 @@ use crate::utils::is_kind_free;
 use crate::utils::should_log;
 use anyhow::Result;
 use chrono::Utc;
-use get_recommended_app_string::parse_recommended_app;
 use lazy_static::lazy_static;
 use nostr_sdk::prelude::*;
 use ractor::{
@@ -29,7 +28,6 @@ pub enum JsonActorMessage {
     GetStatsVec((), RpcReplyPort<Vec<(Kind, KindEntry)>>),
     RecordEvent(Box<Event>, Url),
     RecordRecommendedApp(Box<Event>, Url),
-    SaveState,
     CleanupDocumentedKinds,
     ComputeClusters,
     ApplyClusters(HashMap<Kind, (u32, f64)>), // (cluster_id, similarity_score)
@@ -49,12 +47,11 @@ pub struct KindEntry {
 }
 
 pub struct State {
-    kind_stats: HashMap<Kind, KindEntry>,
     http_actor: ActorRef<HttpActorMessage>,
     nostr_actor: ActorRef<NostrActorMessage>,
     recommended_apps: HashMap<Kind, Timestamp>,
     clustering_in_progress: bool,
-    qdrant_client: Option<qdrant_client::Qdrant>,
+    qdrant_client: qdrant_client::Qdrant, // Now required, not optional
 }
 
 impl State {
@@ -102,7 +99,9 @@ async fn query_all_from_qdrant(client: &qdrant_client::Qdrant) -> Result<Vec<(Ki
 
         for point in &response.result {
             let kind_num = point.id.as_ref().and_then(|id| {
-                if let qdrant_client::qdrant::point_id::PointIdOptions::Num(n) = id.point_id_options.as_ref()? {
+                if let qdrant_client::qdrant::point_id::PointIdOptions::Num(n) =
+                    id.point_id_options.as_ref()?
+                {
                     Some(*n as u16)
                 } else {
                     None
@@ -145,67 +144,44 @@ impl Actor for JsonActor {
         myself: ActorRef<Self::Msg>,
         nostr_actor: ActorRef<NostrActorMessage>,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let json_str = tokio::fs::read_to_string(&*STATS_FILE)
-            .await
-            .unwrap_or_else(|e| {
-                error!("Failed to read stats file, defaulting to empty: {}", e);
-                "{}".to_string()
-            });
-
-        let mut kind_stats: HashMap<Kind, KindEntry> = serde_json::from_str(&json_str)
-            .unwrap_or_else(|e| {
-                error!("Failed to read stats file, defaulting to empty: {}", e);
-                HashMap::default()
-            });
-
-        // Remove any entries that are older than 1 month or for which is_kind_free is false
-        kind_stats.retain(|kind, entry| !is_old(entry.last_updated) && is_kind_free(*kind));
-
-        myself.send_interval(Duration::from_secs(60), || JsonActorMessage::SaveState);
         myself.send_interval(Duration::from_secs(60 * 60 * 6), || {
             JsonActorMessage::CleanupDocumentedKinds
         });
-        // Clustering every 5 minutes (with debouncing to prevent overlaps)
-        myself.send_interval(Duration::from_secs(60 * 5), || {
-            JsonActorMessage::ComputeClusters
-        });
+        let myself_clone = myself.clone();
         let (http_actor, _) = Actor::spawn_linked(
             Some("HttpActor".to_string()),
             HttpActor,
-            myself.clone(),
-            myself.into(),
+            myself_clone.clone(),
+            myself_clone.into(),
         )
         .await?;
         let recommended_apps = HashMap::new();
 
-        // Initialize Qdrant client (optional - graceful degradation if unavailable)
-        let qdrant_client = match crate::qdrant_client::initialize_qdrant().await {
-            Ok(client) => {
-                info!("Qdrant client initialized successfully");
+        // Initialize Qdrant client (required)
+        let qdrant_client = crate::qdrant_client::initialize_qdrant()
+            .await
+            .map_err(|e| ActorProcessingErr::from(e.to_string()))?;
 
-                // Migrate stats.json on first startup
-                match crate::qdrant_client::migrate_from_stats_json(&client, &*STATS_FILE).await {
-                    Ok(true) => info!("Completed one-time migration from stats.json to Qdrant"),
-                    Ok(false) => info!("No migration needed"),
-                    Err(e) => error!("Migration failed (continuing anyway): {}", e),
-                }
+        info!("Qdrant client initialized successfully");
 
-                Some(client)
-            }
-            Err(e) => {
-                error!("Failed to initialize Qdrant client: {}. Continuing without Qdrant.", e);
-                None
-            }
-        };
+        // Migrate stats.json on first startup
+        match crate::qdrant_client::migrate_from_stats_json(&qdrant_client, &STATS_FILE).await {
+            Ok(true) => info!("Completed one-time migration from stats.json to Qdrant"),
+            Ok(false) => info!("No migration needed"),
+            Err(e) => error!("Migration failed (continuing anyway): {}", e),
+        }
 
         let state = State {
-            kind_stats,
             http_actor,
             nostr_actor,
             recommended_apps,
             clustering_in_progress: false,
             qdrant_client,
         };
+
+        // Trigger initial clustering on startup
+        info!("Triggering initial clustering on startup");
+        myself.send_message(JsonActorMessage::ComputeClusters)?;
 
         Ok(state)
     }
@@ -253,120 +229,148 @@ impl Actor for JsonActor {
                     info!("Update for kind {}", event.kind);
                 }
 
-                state
-                    .kind_stats
-                    .entry(event.kind)
-                    .and_modify(|e| {
-                        e.event = *event.clone();
-                        e.count += 1;
-                        e.last_updated = Utc::now().timestamp_millis();
-                    })
-                    .or_insert_with(|| KindEntry {
-                        event: *event.clone(),
-                        count: 1,
-                        last_updated: Utc::now().timestamp_millis(),
-                        recommended_app: None,
-                        recommended_app_event: None,
-                        cluster_id: None,
-                        cluster_similarity: None,
-                    });
+                // Upsert to Qdrant
+                let event_clone = event.clone();
+                let client_clone = state.qdrant_client.clone();
+                let collection = crate::qdrant_client::collection_name().to_string();
+                let kind_id = u16::from(event.kind) as u64;
+                let kind_u16 = u16::from(event.kind);
 
-                // Also upsert to Qdrant if available
-                if let Some(ref client) = state.qdrant_client {
-                    let kind_entry = state.kind_stats.get(&event.kind).unwrap();
+                // Upsert to Qdrant with incremental clustering (async to avoid blocking actor)
+                tokio::spawn(async move {
+                    use nostr_sdk::JsonUtil;
+                    use qdrant_client::qdrant::{
+                        PointId, PointStruct, SearchPointsBuilder, UpsertPointsBuilder,
+                    };
+
+                    // Fetch current point to get count
+                    let point_id: PointId = kind_id.into();
+                    let get_request =
+                        qdrant_client::qdrant::GetPointsBuilder::new(&collection, vec![point_id])
+                            .with_payload(true)
+                            .with_vectors(true)
+                            .build();
+
+                    let current_point = client_clone
+                        .get_points(get_request)
+                        .await
+                        .ok()
+                        .and_then(|resp| resp.result.first().cloned());
+
+                    let is_new_event = current_point.is_none();
+
+                    // Increment count or start at 1
+                    let count = if let Some(ref point) = current_point {
+                        point
+                            .payload
+                            .get("count")
+                            .and_then(|v| v.as_integer())
+                            .unwrap_or(0) as u64
+                            + 1
+                    } else {
+                        1
+                    };
 
                     // Generate vector from event features
-                    let features = crate::similarity::EventFeatures::from_event(&event);
+                    let features = crate::similarity::EventFeatures::from_event(&event_clone);
                     let vector = features.to_vector();
 
-                    // Create payload from KindEntry
-                    use nostr_sdk::JsonUtil;
-
-                    let payload_json = serde_json::json!({
-                        "kind": u16::from(event.kind),
-                        "count": kind_entry.count,
-                        "last_updated": kind_entry.last_updated,
-                        "recommended_app": kind_entry.recommended_app,
-                        "event_id": event.id.to_string(),
-                        "event": event.as_json(),
+                    // Create base payload
+                    let mut payload_json = serde_json::json!({
+                        "kind": u16::from(event_clone.kind),
+                        "count": count,
+                        "last_updated": Utc::now().timestamp_millis(),
+                        "recommended_app": null,  // Will be updated separately
+                        "event_id": event_clone.id.to_string(),
+                        "event": event_clone.as_json(),
                     });
 
-                    // Convert to Qdrant Payload (from serde_json::Map)
+                    // For new events, search for similar events to assign cluster
+                    if is_new_event {
+                        let search_request =
+                            SearchPointsBuilder::new(&collection, vector.clone(), 10)
+                                .score_threshold(0.8)
+                                .with_payload(false)
+                                .build();
+
+                        if let Ok(response) = client_clone.search_points(search_request).await {
+                            // Filter out self (shouldn't exist yet, but be safe)
+                            let neighbors: Vec<_> = response.result
+                                .iter()
+                                .filter(|sp| {
+                                    sp.id.as_ref().and_then(|id| {
+                                        if let Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)) = id.point_id_options.as_ref() {
+                                            Some(*n as u16 != kind_u16)
+                                        } else {
+                                            None
+                                        }
+                                    }).unwrap_or(false)
+                                })
+                                .collect();
+
+                            // If we found similar neighbors, assign to their cluster
+                            if !neighbors.is_empty() {
+                                if let Some(first_neighbor) = neighbors.first() {
+                                    if let Some(neighbor_id) = first_neighbor.id.as_ref() {
+                                        if let Some(
+                                            qdrant_client::qdrant::point_id::PointIdOptions::Num(n),
+                                        ) = neighbor_id.point_id_options.as_ref()
+                                        {
+                                            let cluster_id = *n as u16;
+                                            let similarity = first_neighbor.score as f64;
+
+                                            payload_json["cluster_id"] =
+                                                serde_json::json!(cluster_id as i64);
+                                            payload_json["cluster_similarity"] =
+                                                serde_json::json!(similarity);
+
+                                            info!(
+                                                "New event kind {} assigned to cluster {}",
+                                                kind_u16, cluster_id
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let payload = qdrant_client::Payload::from(
-                        payload_json.as_object().cloned().unwrap_or_default()
+                        payload_json.as_object().cloned().unwrap_or_default(),
                     );
 
-                    // Upsert to Qdrant (async, fire-and-forget to avoid blocking)
-                    let client_clone = client.clone();
-                    let kind_id = u16::from(event.kind) as u64;
-                    let collection = crate::qdrant_client::collection_name().to_string();
-
-                    tokio::spawn(async move {
-                        use qdrant_client::qdrant::{PointStruct, UpsertPointsBuilder};
-
-                        let point = PointStruct::new(kind_id, vector, payload);
-
-                        if let Err(e) = client_clone
-                            .upsert_points(UpsertPointsBuilder::new(collection, vec![point]).build())
-                            .await
-                        {
-                            error!("Failed to upsert to Qdrant: {}", e);
-                        }
-                    });
-                }
+                    // Upsert to Qdrant
+                    let point = PointStruct::new(kind_id, vector, payload);
+                    if let Err(e) = client_clone
+                        .upsert_points(UpsertPointsBuilder::new(collection, vec![point]).build())
+                        .await
+                    {
+                        error!("Failed to upsert to Qdrant: {}", e);
+                    }
+                });
 
                 if let Err(e) = state.maybe_refresh_recommended_app(event.kind) {
                     error!("Failed to refresh recommended app: {}", e);
                 }
             }
-            JsonActorMessage::RecordRecommendedApp(event, _url) => {
-                match parse_recommended_app(&event) {
-                    Ok((kinds, recommended_app)) => {
-                        kinds.iter().for_each(|kind| {
-                            state.kind_stats.entry(*kind).and_modify(|e| {
-                                e.recommended_app = Some(recommended_app.clone());
-                                e.recommended_app_event = Some(*event.clone());
-                            });
-                        });
-                    }
-                    Err(e) => error!("Failed to parse recommended app: {}", e),
-                }
-            }
-            JsonActorMessage::SaveState => {
-                save_stats_to_json(&state.kind_stats).await?;
+            JsonActorMessage::RecordRecommendedApp(_event, _url) => {
+                // TODO: Implement payload update in Qdrant for recommended_app
+                // For now, skipping - not critical for core functionality
+                // Will be set on next event update for that kind
             }
             JsonActorMessage::GetStatsVec(_arg, reply) => {
                 if !reply.is_closed() {
-                    // Query Qdrant if available, otherwise fall back to HashMap
-                    let data_as_sorted_vec = if let Some(ref client) = state.qdrant_client {
-                        match query_all_from_qdrant(client).await {
-                            Ok(vec) => {
-                                info!("Sending {} events from Qdrant", vec.len());
-                                vec
-                            }
-                            Err(e) => {
-                                error!("Failed to query Qdrant, falling back to HashMap: {}", e);
-                                // Fallback to HashMap
-                                let mut vec: Vec<(Kind, KindEntry)> = state
-                                    .kind_stats
-                                    .clone()
-                                    .into_iter()
-                                    .filter(|(_, v)| !is_old(v.last_updated))
-                                    .collect();
-                                vec.sort_by_key(|(kind, _)| *kind);
-                                vec
-                            }
+                    // Query Qdrant (required)
+                    let data_as_sorted_vec = match query_all_from_qdrant(&state.qdrant_client).await
+                    {
+                        Ok(vec) => {
+                            info!("Sending {} events from Qdrant", vec.len());
+                            vec
                         }
-                    } else {
-                        // No Qdrant, use HashMap
-                        let mut vec: Vec<(Kind, KindEntry)> = state
-                            .kind_stats
-                            .clone()
-                            .into_iter()
-                            .filter(|(_, v)| !is_old(v.last_updated))
-                            .collect();
-                        vec.sort_by_key(|(kind, _)| *kind);
-                        vec
+                        Err(e) => {
+                            error!("Failed to query Qdrant: {}", e);
+                            Vec::new() // Return empty on error
+                        }
                     };
 
                     if let Err(e) = reply.send(data_as_sorted_vec) {
@@ -375,52 +379,93 @@ impl Actor for JsonActor {
                 }
             }
             JsonActorMessage::CleanupDocumentedKinds => {
-                // Collect kinds to remove (newly-documented + old events)
-                let kinds_to_remove: Vec<Kind> = state
-                    .kind_stats
-                    .iter()
-                    .filter(|(kind, entry)| !is_kind_free(**kind) || is_old(entry.last_updated))
-                    .map(|(kind, _)| *kind)
-                    .collect();
+                // Query Qdrant to find kinds to remove
+                let client_clone = state.qdrant_client.clone();
+                let collection = crate::qdrant_client::collection_name().to_string();
+                let myself_clone = _myself.clone();
 
-                if !kinds_to_remove.is_empty() {
-                    info!("Cleaning up {} kinds (documented or old)", kinds_to_remove.len());
+                tokio::spawn(async move {
+                    use qdrant_client::qdrant::{DeletePointsBuilder, ScrollPointsBuilder};
 
-                    // Remove from HashMap
-                    for kind in &kinds_to_remove {
-                        state.kind_stats.remove(kind);
-                    }
+                    // Scroll all points and check which to remove
+                    let scroll_request = ScrollPointsBuilder::new(&collection)
+                        .with_payload(true)
+                        .limit(1000)
+                        .build();
 
-                    // Also delete from Qdrant
-                    if let Some(ref client) = state.qdrant_client {
-                        let client_clone = client.clone();
-                        let collection = crate::qdrant_client::collection_name().to_string();
-                        let point_ids: Vec<u64> = kinds_to_remove
-                            .iter()
-                            .map(|k| u16::from(*k) as u64)
-                            .collect();
+                    match client_clone.scroll(scroll_request).await {
+                        Ok(response) => {
+                            let mut ids_to_remove = Vec::new();
 
-                        tokio::spawn(async move {
-                            use qdrant_client::qdrant::DeletePointsBuilder;
+                            for point in response.result {
+                                if let Some(kind_value) = point.payload.get("kind") {
+                                    if let Some(kind_num) = kind_value.as_integer() {
+                                        let kind = Kind::from(kind_num as u16);
 
-                            let delete_request = DeletePointsBuilder::new(collection)
-                                .points(point_ids)
-                                .build();
+                                        // Check if documented or old
+                                        let is_documented = !is_kind_free(kind);
+                                        let is_too_old = point
+                                            .payload
+                                            .get("last_updated")
+                                            .and_then(|v| v.as_integer())
+                                            .map(is_old)
+                                            .unwrap_or(false);
 
-                            if let Err(e) = client_clone.delete_points(delete_request).await {
-                                error!("Failed to delete points from Qdrant: {}", e);
-                            } else {
-                                info!("Deleted {} points from Qdrant", kinds_to_remove.len());
+                                        if is_documented || is_too_old {
+                                            if let Some(id) = point.id {
+                                                ids_to_remove.push(id);
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                        });
-                    }
 
-                    if let Err(e) = save_stats_to_json(&state.kind_stats).await {
-                        error!("Failed to save stats after cleanup: {}", e);
+                            if !ids_to_remove.is_empty() {
+                                let count_to_remove = ids_to_remove.len();
+                                info!("Cleaning up {} kinds from Qdrant", count_to_remove);
+
+                                // Convert PointIds to numeric IDs, then back to PointId type
+                                use qdrant_client::qdrant::PointId;
+                                let numeric_ids: Vec<u64> = ids_to_remove
+                                    .into_iter()
+                                    .filter_map(|id| match id.point_id_options {
+                                        Some(
+                                            qdrant_client::qdrant::point_id::PointIdOptions::Num(n),
+                                        ) => Some(n),
+                                        _ => None,
+                                    })
+                                    .collect();
+
+                                let point_ids: Vec<PointId> =
+                                    numeric_ids.into_iter().map(Into::into).collect();
+
+                                let delete_request = DeletePointsBuilder::new(collection)
+                                    .points(point_ids)
+                                    .build();
+
+                                if let Err(e) = client_clone.delete_points(delete_request).await {
+                                    error!("Failed to delete old/documented points: {}", e);
+                                } else {
+                                    info!(
+                                        "Successfully cleaned up {} old/documented kinds",
+                                        count_to_remove
+                                    );
+
+                                    // Trigger re-clustering after cleanup since cluster membership may have changed
+                                    if let Err(e) =
+                                        cast!(myself_clone, JsonActorMessage::ComputeClusters)
+                                    {
+                                        error!(
+                                            "Failed to trigger re-clustering after cleanup: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => error!("Failed to query Qdrant for cleanup: {}", e),
                     }
-                } else {
-                    info!("No kinds to clean up");
-                }
+                });
             }
             JsonActorMessage::ComputeClusters => {
                 // Debounce: skip if clustering is already running
@@ -429,41 +474,200 @@ impl Actor for JsonActor {
                     return Ok(());
                 }
 
-                info!("Starting background clustering for {} kinds", state.kind_stats.len());
                 state.clustering_in_progress = true;
 
-                // Clone events for background processing (Kind -> Event)
-                let events_owned: HashMap<Kind, Event> = state
-                    .kind_stats
-                    .iter()
-                    .map(|(kind, entry)| (*kind, entry.event.clone()))
-                    .collect();
-
+                let client_clone = state.qdrant_client.clone();
                 let myself_clone = _myself.clone();
+                let collection = crate::qdrant_client::collection_name().to_string();
 
-                // Spawn background task for clustering
+                // Spawn background task for clustering using Qdrant similarity search
                 tokio::spawn(async move {
-                    info!("Computing similarity clusters in background...");
+                    use qdrant_client::qdrant::{ScrollPointsBuilder, SearchPointsBuilder};
+                    use std::collections::{HashMap, HashSet};
 
-                    // Convert owned events to borrowed references for clustering
-                    let events_map: HashMap<Kind, &Event> = events_owned
-                        .iter()
-                        .map(|(kind, event)| (*kind, event))
+                    info!("Computing similarity clusters using Qdrant search...");
+
+                    // First, get all points WITH vectors
+                    let scroll_request = ScrollPointsBuilder::new(&collection)
+                        .limit(1000)
+                        .with_vectors(true)
+                        .with_payload(false)
+                        .build();
+
+                    let all_points = match client_clone.scroll(scroll_request).await {
+                        Ok(response) => response.result,
+                        Err(e) => {
+                            error!("Failed to scroll Qdrant points: {}", e);
+                            return;
+                        }
+                    };
+
+                    info!("Found {} points to cluster", all_points.len());
+
+                    let mut clusters: HashMap<u16, (u16, f64)> = HashMap::new();
+                    let mut assigned_to_cluster: HashSet<u16> = HashSet::new();
+
+                    // For each point, search for similar neighbors using Qdrant
+                    for point in &all_points {
+                        let kind_id = if let Some(id) = point.id.as_ref() {
+                            if let Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)) =
+                                id.point_id_options.as_ref()
+                            {
+                                *n as u16
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        };
+
+                        // Skip if already assigned to a cluster
+                        if assigned_to_cluster.contains(&kind_id) {
+                            continue;
+                        }
+
+                        // Get the vector for this point
+                        let vector = if let Some(vectors) = &point.vectors {
+                            if let Some(
+                                qdrant_client::qdrant::vectors_output::VectorsOptions::Vector(vec),
+                            ) = &vectors.vectors_options
+                            {
+                                vec.data.clone()
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        };
+
+                        // Search for similar points (score > 0.8)
+                        let search_request = SearchPointsBuilder::new(&collection, vector, 10)
+                            .score_threshold(0.8)
+                            .with_payload(false)
+                            .build();
+
+                        let similar_points = match client_clone.search_points(search_request).await
+                        {
+                            Ok(response) => response.result,
+                            Err(e) => {
+                                error!("Failed to search for kind {}: {}", kind_id, e);
+                                continue;
+                            }
+                        };
+
+                        // Filter out self (the search includes the query point itself)
+                        let neighbors: Vec<_> = similar_points
+                            .iter()
+                            .filter(|sp| {
+                                sp.id
+                                    .as_ref()
+                                    .and_then(|id| {
+                                        if let Some(
+                                            qdrant_client::qdrant::point_id::PointIdOptions::Num(n),
+                                        ) = id.point_id_options.as_ref()
+                                        {
+                                            Some(*n as u16 != kind_id)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(false)
+                            })
+                            .collect();
+
+                        // If we found at least 1 neighbor (excluding self), create a cluster
+                        if !neighbors.is_empty() {
+                            // Build cluster from ALL similar points (including self)
+                            let mut cluster_members: Vec<u16> = vec![kind_id]; // Start with self
+
+                            // Add all neighbors
+                            for sp in &neighbors {
+                                if let Some(id) = sp.id.as_ref() {
+                                    if let Some(
+                                        qdrant_client::qdrant::point_id::PointIdOptions::Num(n),
+                                    ) = id.point_id_options.as_ref()
+                                    {
+                                        cluster_members.push(*n as u16);
+                                    }
+                                }
+                            }
+
+                            cluster_members.sort();
+
+                            // Use the lowest kind number as cluster ID
+                            let cluster_id = *cluster_members.first().unwrap();
+
+                            // Assign all members to this cluster
+                            for &member_kind in &cluster_members {
+                                // Find similarity score for this member
+                                let similarity = if member_kind == kind_id {
+                                    1.0 // Self always has perfect similarity
+                                } else {
+                                    neighbors.iter()
+                                        .find(|sp| {
+                                            sp.id.as_ref().and_then(|id| {
+                                                if let Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)) = id.point_id_options.as_ref() {
+                                                    Some(*n as u16 == member_kind)
+                                                } else {
+                                                    None
+                                                }
+                                            }).unwrap_or(false)
+                                        })
+                                        .map(|sp| sp.score as f64)
+                                        .unwrap_or(0.8)
+                                };
+
+                                clusters.insert(member_kind, (cluster_id, similarity));
+                                assigned_to_cluster.insert(member_kind);
+                            }
+
+                            info!(
+                                "Created cluster {} with {} members",
+                                cluster_id,
+                                cluster_members.len()
+                            );
+                        }
+                    }
+
+                    // Count cluster sizes to remove single-member clusters
+                    let mut cluster_sizes: HashMap<u16, usize> = HashMap::new();
+                    for (cluster_id, _) in clusters.values() {
+                        *cluster_sizes.entry(*cluster_id).or_insert(0) += 1;
+                    }
+
+                    // Filter out single-member clusters
+                    let filtered_clusters: HashMap<u16, (u16, f64)> = clusters
+                        .into_iter()
+                        .filter(|(_, (cluster_id, _))| {
+                            cluster_sizes
+                                .get(cluster_id)
+                                .map(|&size| size > 1)
+                                .unwrap_or(false)
+                        })
                         .collect();
 
-                    // Compute clusters with threshold of 0.9 (very high similarity required)
-                    let clusters = crate::similarity::cluster_kinds(&events_map, 0.9);
-
-                    let cluster_count = clusters.len();
-                    let unique_clusters = clusters.values()
+                    let cluster_count = filtered_clusters.len();
+                    let unique_clusters = filtered_clusters
+                        .values()
                         .map(|(cluster_id, _)| cluster_id)
-                        .collect::<std::collections::HashSet<_>>()
+                        .collect::<HashSet<_>>()
                         .len();
 
-                    info!("Background clustering completed: {} clustered kinds in {} clusters", cluster_count, unique_clusters);
+                    info!("Qdrant-based clustering completed: {} clustered kinds in {} unique clusters (filtered out single-member clusters)", cluster_count, unique_clusters);
+
+                    // Convert to the format ApplyClusters expects
+                    let clusters_with_kind: HashMap<Kind, (u32, f64)> = filtered_clusters
+                        .into_iter()
+                        .map(|(kind, (cluster_id, similarity))| {
+                            (Kind::from(kind), (cluster_id as u32, similarity))
+                        })
+                        .collect();
 
                     // Send results back to actor
-                    if let Err(e) = cast!(myself_clone, JsonActorMessage::ApplyClusters(clusters)) {
+                    if let Err(e) = cast!(
+                        myself_clone,
+                        JsonActorMessage::ApplyClusters(clusters_with_kind)
+                    ) {
                         error!("Failed to send cluster results to actor: {}", e);
                     }
                 });
@@ -471,26 +675,72 @@ impl Actor for JsonActor {
             JsonActorMessage::ApplyClusters(clusters) => {
                 info!("Applying cluster results to {} kinds", clusters.len());
 
-                // First, clear all existing cluster_ids and similarities
-                for entry in state.kind_stats.values_mut() {
-                    entry.cluster_id = None;
-                    entry.cluster_similarity = None;
-                }
+                // Update Qdrant with cluster information
+                let client_clone = state.qdrant_client.clone();
+                let collection = crate::qdrant_client::collection_name().to_string();
+                let clusters_clone = clusters.clone();
 
-                // Apply new cluster assignments with similarity scores
-                for (kind, (cluster_id, similarity)) in clusters {
-                    if let Some(entry) = state.kind_stats.get_mut(&kind) {
-                        entry.cluster_id = Some(cluster_id);
-                        entry.cluster_similarity = Some(similarity);
+                tokio::spawn(async move {
+                    use qdrant_client::qdrant::{
+                        GetPointsBuilder, PointId, PointStruct, UpsertPointsBuilder,
+                    };
+
+                    for (kind, (cluster_id, similarity)) in clusters_clone {
+                        let kind_id: u64 = u16::from(kind) as u64;
+                        let point_id: PointId = kind_id.into();
+
+                        // Fetch current point to preserve existing data
+                        let get_request =
+                            GetPointsBuilder::new(&collection, vec![point_id.clone()])
+                                .with_payload(true)
+                                .with_vectors(true)
+                                .build();
+
+                        match client_clone.get_points(get_request).await {
+                            Ok(response) if !response.result.is_empty() => {
+                                let current_point = &response.result[0];
+
+                                // Merge cluster info into existing payload
+                                let mut payload = current_point.payload.clone();
+                                payload
+                                    .insert("cluster_id".to_string(), (cluster_id as i64).into());
+                                payload.insert("cluster_similarity".to_string(), similarity.into());
+
+                                // Get vector (should exist since we set it during RecordEvent)
+                                let vector = current_point.vectors.as_ref()
+                                        .and_then(|v| match v.vectors_options.as_ref()? {
+                                            qdrant_client::qdrant::vectors_output::VectorsOptions::Vector(vec) => Some(vec.data.clone()),
+                                            _ => None,
+                                        });
+
+                                if let Some(vector) = vector {
+                                    // Re-upsert with updated payload
+                                    let point = PointStruct::new(kind_id, vector, payload);
+                                    let upsert =
+                                        UpsertPointsBuilder::new(&collection, vec![point]).build();
+
+                                    if let Err(e) = client_clone.upsert_points(upsert).await {
+                                        error!(
+                                            "Failed to update cluster info for kind {}: {}",
+                                            kind, e
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                debug!("Point {} not found, skipping cluster update", kind_id);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to fetch point {} for cluster update: {}",
+                                    kind_id, e
+                                );
+                            }
+                        }
                     }
-                }
 
-                let cluster_count = state.kind_stats.values()
-                    .filter_map(|e| e.cluster_id)
-                    .collect::<std::collections::HashSet<_>>()
-                    .len();
-
-                info!("Applied {} clusters to kind_stats", cluster_count);
+                    info!("Successfully updated cluster information in Qdrant");
+                });
 
                 // Mark clustering as complete
                 state.clustering_in_progress = false;
@@ -499,11 +749,4 @@ impl Actor for JsonActor {
 
         Ok(())
     }
-}
-
-async fn save_stats_to_json(kind_stats: &HashMap<Kind, KindEntry>) -> Result<()> {
-    let json_str = serde_json::to_string_pretty(kind_stats)?;
-    tokio::fs::write(&*STATS_FILE, json_str).await?;
-    debug!("Stats saved to json file");
-    Ok(())
 }

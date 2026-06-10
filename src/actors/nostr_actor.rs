@@ -11,6 +11,13 @@ use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+// Always-on popular relays (never rotated)
+const ALWAYS_ON_RELAYS: [&str; 3] = [
+    "wss://relay.damus.io",
+    "wss://relay.primal.net",
+    "wss://nos.lol",
+];
+
 const POPULAR_RELAYS_FALLBACK: [&str; 4] = [
     "wss://relay.damus.io",
     "wss://relay.primal.net",
@@ -27,6 +34,7 @@ pub struct State {
     client: Client,
     subscription_ids: HashMap<SubscriptionId, ()>,
     latest_event_received_at: DateTime<Utc>,
+    current_rotating_relays: Vec<String>, // Track currently connected rotating relays
 }
 
 impl State {
@@ -175,6 +183,7 @@ pub enum NostrActorMessage {
     GetRecommendedApp(Kind),
     NewEvent(Box<Event>, SubscriptionId, Url),
     HealthCheck,
+    RotateRelays,
 }
 
 /// Parse the nostr.watch online-relays response.
@@ -196,7 +205,8 @@ fn parse_online_relays(status_code: u16, body: &str) -> Option<Vec<String>> {
     Some(relays)
 }
 
-async fn get_relays() -> Vec<String> {
+/// Get rotating relays, excluding always-on relays and previously used relays
+async fn get_rotating_relays(exclude: &[String]) -> Vec<String> {
     let fetched = match reqwest::get("https://api.nostr.watch/v1/online").await {
         Ok(response) => {
             let status_code = response.status().as_u16();
@@ -204,38 +214,54 @@ async fn get_relays() -> Vec<String> {
             parse_online_relays(status_code, &body)
         }
         Err(e) => {
-            error!("Failed to fetch relays from Nostr API: {}", e);
+            error!("Failed to fetch relays from nostr.watch: {}", e);
             None
         }
     };
 
-    let relays = match fetched {
-        Some(mut relays) => {
-            relays.truncate(5);
-            info!("Fetched relays from nostr.watch");
-            relays
+    let always_on_set: Vec<String> = ALWAYS_ON_RELAYS.iter().map(|s| s.to_string()).collect();
+
+    match fetched {
+        Some(all_relays) => {
+            let filtered: Vec<String> = all_relays
+                .into_iter()
+                .filter(|r| !always_on_set.contains(r) && !exclude.contains(r))
+                .take(5)
+                .collect();
+
+            info!(
+                "Fetched {} rotating relays from nostr.watch",
+                filtered.len()
+            );
+            filtered
         }
         None => {
             warn!("No usable relay list from nostr.watch, using fallback relays");
             POPULAR_RELAYS_FALLBACK
                 .iter()
+                .filter(|r| !ALWAYS_ON_RELAYS.contains(r) && !exclude.contains(&r.to_string()))
                 .map(|s| s.to_string())
+                .take(5)
                 .collect()
         }
-    };
-
-    info!("Relays: {:?}", relays);
-    relays
+    }
 }
 
-async fn refresh_relays(client: &Client) {
-    for relay in get_relays().await {
-        if let Err(e) = client.add_relay(relay.as_str()).await {
-            error!("Failed to add relay {}: {}", relay, e);
-        }
-    }
+/// Get initial relay set (always-on + rotating)
+async fn get_initial_relays() -> (Vec<String>, Vec<String>) {
+    let always_on: Vec<String> = ALWAYS_ON_RELAYS.iter().map(|s| s.to_string()).collect();
+    let rotating = get_rotating_relays(&[]).await;
 
-    client.connect().await;
+    let all_relays: Vec<String> = always_on.iter().chain(rotating.iter()).cloned().collect();
+    info!(
+        "Initial relays: {} always-on + {} rotating = {}",
+        always_on.len(),
+        rotating.len(),
+        all_relays.len()
+    );
+    info!("Relays: {:?}", all_relays);
+
+    (all_relays, rotating)
 }
 
 #[ractor::async_trait]
@@ -251,7 +277,12 @@ impl Actor for NostrActor {
     ) -> Result<Self::State, ActorProcessingErr> {
         let client = Client::default();
 
-        refresh_relays(&client).await;
+        let (all_relays, rotating_relays) = get_initial_relays().await;
+        for relay in all_relays {
+            client.add_relay(relay).await?;
+        }
+
+        client.connect().await;
 
         let (json_actor, _) = Actor::spawn_linked(
             Some("JsonActor".to_string()),
@@ -261,12 +292,18 @@ impl Actor for NostrActor {
         )
         .await?;
 
+        // Schedule relay rotation every 30 minutes
+        myself.send_interval(Duration::from_secs(60 * 30), || {
+            NostrActorMessage::RotateRelays
+        });
+
         let mut state = State {
             json_actor,
             client,
             cancellation_token: None,
             subscription_ids: HashMap::new(),
             latest_event_received_at: Utc::now(),
+            current_rotating_relays: rotating_relays,
         };
 
         state.reset_notification_handler(myself);
@@ -321,10 +358,16 @@ impl Actor for NostrActor {
             NostrActorMessage::HealthCheck => {
                 if state.latest_event_received_at + ChronoDuration::seconds(60 * 5) < Utc::now() {
                     warn!(
-                        "No events received in the last 5 minutes, refreshing relays and resetting notification handler"
+                        "No events received in the last 5 minutes, reconnecting always-on relays and resetting notification handler"
                     );
 
-                    refresh_relays(&state.client).await;
+                    for relay in ALWAYS_ON_RELAYS {
+                        if let Err(e) = state.client.add_relay(relay).await {
+                            error!("Failed to add relay {}: {}", relay, e);
+                        }
+                    }
+                    state.client.connect().await;
+
                     state.reset_notification_handler(myself);
                 }
             }
@@ -344,6 +387,45 @@ impl Actor for NostrActor {
                         JsonActorMessage::RecordEvent(event, relay_url)
                     )?;
                 }
+            }
+            NostrActorMessage::RotateRelays => {
+                info!("Rotating relays - disconnecting from old rotating relays and connecting to new ones");
+
+                // Get new rotating relays, excluding the current ones
+                let new_rotating_relays = get_rotating_relays(&state.current_rotating_relays).await;
+
+                if new_rotating_relays.is_empty() {
+                    warn!("No new rotating relays available, keeping current ones");
+                    return Ok(());
+                }
+
+                // Disconnect from old rotating relays
+                for relay_url in &state.current_rotating_relays {
+                    if let Ok(url) = Url::parse(relay_url) {
+                        info!("Disconnecting from rotating relay: {}", relay_url);
+                        if let Err(e) = state.client.disconnect_relay(url).await {
+                            warn!("Failed to disconnect from {}: {}", relay_url, e);
+                        }
+                    }
+                }
+
+                // Connect to new rotating relays
+                for relay_url in &new_rotating_relays {
+                    info!("Connecting to new rotating relay: {}", relay_url);
+                    if let Err(e) = state.client.add_relay(relay_url).await {
+                        warn!("Failed to add relay {}: {}", relay_url, e);
+                    }
+                }
+
+                state.client.connect().await;
+
+                // Update state
+                state.current_rotating_relays = new_rotating_relays.clone();
+
+                info!(
+                    "Relay rotation complete. New rotating relays: {:?}",
+                    new_rotating_relays
+                );
             }
         }
 

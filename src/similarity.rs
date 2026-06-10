@@ -24,44 +24,78 @@ impl EventFeatures {
         }
     }
 
-    /// Convert features to a dense vector for Qdrant storage
-    /// Vector dimension: 64 (32 for tags + 32 for content structure)
+    /// Convert features to a dense vector for Qdrant storage.
+    ///
+    /// Vector dimension: 64
+    /// - 0-31: Feature-hashed tag names (32 buckets)
+    /// - 32-35: Content encoding detection
+    /// - 36-63: Content structure features
     pub fn to_vector(&self) -> Vec<f32> {
         let mut vector = Vec::with_capacity(crate::qdrant_client::vector_size());
 
-        // Common tag types (first 20 dimensions) - binary presence indicators
-        let common_tags = [
-            "e:", "p:", "d:", "a:", "t:", "r:", "i:", "k:", "l:", "L:",
-            "g:", "q:", "m:", "x:", "title:", "summary:", "image:", "published_at:", "alt:", "expiration:"
-        ];
+        // ===== TAG FEATURES (0-31): Feature hashing =====
+        // Extract unique tag names and hash to 32 buckets
+        let mut tag_buckets = [0.0f32; 32];
 
-        for tag_prefix in &common_tags {
-            let has_tag = self.tag_patterns.iter().any(|t| t.starts_with(tag_prefix));
-            vector.push(if has_tag { 1.0 } else { 0.0 });
+        let unique_tag_names: HashSet<String> = self
+            .tag_patterns
+            .iter()
+            .filter_map(|pattern| {
+                // Extract tag name (before first ':')
+                pattern.split(':').next().map(String::from)
+            })
+            .collect();
+
+        for tag_name in unique_tag_names {
+            // Simple hash: sum of char codes modulo 32
+            let hash = tag_name.chars().map(|c| c as u32).sum::<u32>() % 32;
+            tag_buckets[hash as usize] = 1.0;
         }
 
-        // Tag count features (next 6 dimensions)
-        let total_tags = self.tag_patterns.len() as f32;
-        vector.push((total_tags / 10.0).min(1.0)); // Normalized tag count
-        vector.push(if total_tags > 5.0 { 1.0 } else { 0.0 }); // Has many tags
-        vector.push(if total_tags == 0.0 { 1.0 } else { 0.0 }); // Has no tags
+        vector.extend_from_slice(&tag_buckets);
 
-        // Count specific normalized tag types
-        let hex_id_count = self.tag_patterns.iter().filter(|t| t.contains("<HEX_ID>")).count() as f32;
-        vector.push((hex_id_count / 5.0).min(1.0)); // Normalized hex ID count
+        // ===== CONTENT ENCODING DETECTION (32-35): 4 dimensions =====
+        let content = &self.normalized_content;
+        let content_len = content.len() as f32;
 
-        let url_count = self.tag_patterns.iter().filter(|t| t.contains("<URL>")).count() as f32;
-        vector.push((url_count / 3.0).min(1.0)); // Normalized URL count
+        if content_len > 0.0 {
+            // Hex-only ratio (0-9a-f characters)
+            let hex_chars = content.chars().filter(|c| c.is_ascii_hexdigit()).count() as f32;
+            let hex_ratio = hex_chars / content_len;
 
-        let long_value_count = self.tag_patterns.iter().filter(|t| t.contains("<LONG_VALUE>")).count() as f32;
-        vector.push((long_value_count / 3.0).min(1.0)); // Normalized long value count
+            // Base64-like ratio (A-Za-z0-9+/= characters)
+            let base64_chars = content
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '+' || *c == '/' || *c == '=')
+                .count() as f32;
+            let base64_ratio = base64_chars / content_len;
 
-        // Content features (next 32 dimensions)
-        let content_len = self.normalized_content.len() as f32;
+            // Alphabetic ratio (works for all languages: Chinese, Spanish, etc.)
+            let alpha_chars = content.chars().filter(|c| c.is_alphabetic()).count() as f32;
+            let alpha_ratio = alpha_chars / content_len;
+
+            // Character diversity (unique chars / total chars)
+            let unique_chars = content.chars().collect::<HashSet<_>>().len() as f32;
+            let char_diversity = unique_chars / content_len;
+
+            vector.push(hex_ratio);
+            vector.push(base64_ratio);
+            vector.push(alpha_ratio);
+            vector.push(char_diversity);
+        } else {
+            // Empty content
+            vector.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
+        }
+
+        // ===== CONTENT STRUCTURE (36-39): 4 dimensions =====
         vector.push((content_len / 1000.0).min(1.0)); // Normalized length (0-1000 chars)
         vector.push(if content_len == 0.0 { 1.0 } else { 0.0 }); // Empty content
         vector.push(if content_len > 500.0 { 1.0 } else { 0.0 }); // Long content
-        vector.push(if content_len > 100.0 && content_len < 500.0 { 1.0 } else { 0.0 }); // Medium content
+        vector.push(if content_len > 100.0 && content_len < 500.0 {
+            1.0
+        } else {
+            0.0
+        }); // Medium content
 
         // Content pattern features
         let has_hex_id = self.normalized_content.contains("<HEX_ID>");
@@ -77,9 +111,21 @@ impl EventFeatures {
         // Word count buckets (next 5 dimensions)
         let word_count = self.normalized_content.split_whitespace().count() as f32;
         vector.push(if word_count == 0.0 { 1.0 } else { 0.0 });
-        vector.push(if word_count > 0.0 && word_count <= 10.0 { 1.0 } else { 0.0 });
-        vector.push(if word_count > 10.0 && word_count <= 50.0 { 1.0 } else { 0.0 });
-        vector.push(if word_count > 50.0 && word_count <= 200.0 { 1.0 } else { 0.0 });
+        vector.push(if word_count > 0.0 && word_count <= 10.0 {
+            1.0
+        } else {
+            0.0
+        });
+        vector.push(if word_count > 10.0 && word_count <= 50.0 {
+            1.0
+        } else {
+            0.0
+        });
+        vector.push(if word_count > 50.0 && word_count <= 200.0 {
+            1.0
+        } else {
+            0.0
+        });
         vector.push(if word_count > 200.0 { 1.0 } else { 0.0 });
 
         // Adaptive JSON structure features (10 dimensions)
@@ -111,8 +157,15 @@ impl EventFeatures {
     }
 }
 
-/// Compute Jaccard similarity between two sets
-/// Returns a value between 0.0 (no overlap) and 1.0 (identical)
+/// Compute Jaccard similarity between two sets.
+///
+/// Returns a value between 0.0 (no overlap) and 1.0 (identical).
+///
+/// # Note
+///
+/// Currently unused - clustering now uses Qdrant's native similarity search.
+/// Kept for potential future use and testing.
+#[allow(dead_code)]
 fn jaccard_similarity(set1: &HashSet<String>, set2: &HashSet<String>) -> f64 {
     if set1.is_empty() && set2.is_empty() {
         return 1.0; // Both empty = identical
@@ -128,12 +181,19 @@ fn jaccard_similarity(set1: &HashSet<String>, set2: &HashSet<String>) -> f64 {
     intersection as f64 / union as f64
 }
 
-/// Compute similarity between two events
-/// Returns a value between 0.0 (completely different) and 1.0 (identical)
+/// Compute similarity between two events.
+///
+/// Returns a value between 0.0 (completely different) and 1.0 (identical).
 ///
 /// The similarity is a weighted combination of:
 /// - Tag pattern similarity (Jaccard index): 60% weight
 /// - Content structure similarity (Jaro-Winkler): 40% weight
+///
+/// # Note
+///
+/// Currently unused - clustering now uses Qdrant's cosine similarity on vector embeddings.
+/// Kept for potential future use and testing.
+#[allow(dead_code)]
 pub fn compute_similarity(features1: &EventFeatures, features2: &EventFeatures) -> f64 {
     // Compute tag similarity using Jaccard index
     let tag_similarity = jaccard_similarity(&features1.tag_patterns, &features2.tag_patterns);
@@ -156,22 +216,27 @@ pub fn compute_similarity(features1: &EventFeatures, features2: &EventFeatures) 
     tag_similarity * TAG_WEIGHT + content_similarity * CONTENT_WEIGHT
 }
 
-/// Cluster kinds based on similarity threshold using greedy algorithm
-/// Returns a map from Kind to (cluster_id, average_similarity)
+/// Cluster kinds based on similarity threshold using greedy algorithm.
+///
+/// Returns a map from Kind to (cluster_id, average_similarity).
 ///
 /// Only kinds with at least one similar neighbor (similarity >= threshold) get a cluster_id.
 /// Standalone kinds remain unclustered.
 ///
-/// Algorithm:
+/// # Algorithm
+///
 /// 1. Sort kinds for deterministic results
 /// 2. For each kind, try to assign it to an existing cluster
 /// 3. If no cluster matches (similarity < threshold), track as potential new cluster
 /// 4. Remove single-member clusters at the end
 /// 5. Compute average similarity for each kind to its cluster members
-pub fn cluster_kinds(
-    events: &HashMap<Kind, &Event>,
-    threshold: f64,
-) -> HashMap<Kind, (u32, f64)> {
+///
+/// # Note
+///
+/// Currently unused - clustering now uses Qdrant's native similarity search API.
+/// Kept for potential future use and testing.
+#[allow(dead_code)]
+pub fn cluster_kinds(events: &HashMap<Kind, &Event>, threshold: f64) -> HashMap<Kind, (u32, f64)> {
     let mut clusters: HashMap<Kind, u32> = HashMap::new();
     let mut cluster_representatives: Vec<(u32, Kind, EventFeatures)> = Vec::new();
 
@@ -216,9 +281,7 @@ pub fn cluster_kinds(
     }
 
     // Keep only clusters with 2+ members
-    clusters.retain(|_kind, cluster_id| {
-        cluster_sizes.get(cluster_id).copied().unwrap_or(0) >= 2
-    });
+    clusters.retain(|_kind, cluster_id| cluster_sizes.get(cluster_id).copied().unwrap_or(0) >= 2);
 
     // Compute similarity to cluster representative for each kind
     // This is much faster than computing all pairwise similarities
@@ -267,9 +330,7 @@ mod tests {
 
         // Create a simple runtime for the test
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            keys.sign_event(unsigned).await.unwrap()
-        })
+        rt.block_on(async { keys.sign_event(unsigned).await.unwrap() })
     }
 
     #[test]
@@ -290,9 +351,7 @@ mod tests {
 
     #[test]
     fn test_jaccard_identical() {
-        let set1: HashSet<String> = vec!["a".to_string(), "b".to_string()]
-            .into_iter()
-            .collect();
+        let set1: HashSet<String> = vec!["a".to_string(), "b".to_string()].into_iter().collect();
         let set2 = set1.clone();
 
         let similarity = jaccard_similarity(&set1, &set2);
@@ -301,12 +360,8 @@ mod tests {
 
     #[test]
     fn test_jaccard_no_overlap() {
-        let set1: HashSet<String> = vec!["a".to_string(), "b".to_string()]
-            .into_iter()
-            .collect();
-        let set2: HashSet<String> = vec!["c".to_string(), "d".to_string()]
-            .into_iter()
-            .collect();
+        let set1: HashSet<String> = vec!["a".to_string(), "b".to_string()].into_iter().collect();
+        let set2: HashSet<String> = vec!["c".to_string(), "d".to_string()].into_iter().collect();
 
         let similarity = jaccard_similarity(&set1, &set2);
         assert_eq!(similarity, 0.0);
@@ -320,8 +375,16 @@ mod tests {
         let hex3 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
         let hex4 = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
-        let event1 = create_test_event(1000, vec![&format!("e:{}", hex1), &format!("p:{}", hex2)], "Hello world");
-        let event2 = create_test_event(1001, vec![&format!("e:{}", hex3), &format!("p:{}", hex4)], "Hello world");
+        let event1 = create_test_event(
+            1000,
+            vec![&format!("e:{}", hex1), &format!("p:{}", hex2)],
+            "Hello world",
+        );
+        let event2 = create_test_event(
+            1001,
+            vec![&format!("e:{}", hex3), &format!("p:{}", hex4)],
+            "Hello world",
+        );
 
         let features1 = EventFeatures::from_event(&event1);
         let features2 = EventFeatures::from_event(&event2);
@@ -352,8 +415,16 @@ mod tests {
         let hex3 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
         let hex4 = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
-        let event1 = create_test_event(1000, vec![&format!("e:{}", hex1), &format!("p:{}", hex2)], "Hello world");
-        let event2 = create_test_event(1001, vec![&format!("e:{}", hex3), &format!("p:{}", hex4)], "Hello world");
+        let event1 = create_test_event(
+            1000,
+            vec![&format!("e:{}", hex1), &format!("p:{}", hex2)],
+            "Hello world",
+        );
+        let event2 = create_test_event(
+            1001,
+            vec![&format!("e:{}", hex3), &format!("p:{}", hex4)],
+            "Hello world",
+        );
         let event3 = create_test_event(1002, vec!["d:test"], "Completely different");
 
         let mut events = HashMap::new();
@@ -364,17 +435,34 @@ mod tests {
         let clusters = cluster_kinds(&events, 0.7);
 
         // event1 and event2 should be in the same cluster (same structure, different IDs)
-        assert!(clusters.contains_key(&Kind::from(1000)), "event1 should be clustered");
-        assert!(clusters.contains_key(&Kind::from(1001)), "event2 should be clustered");
+        assert!(
+            clusters.contains_key(&Kind::from(1000)),
+            "event1 should be clustered"
+        );
+        assert!(
+            clusters.contains_key(&Kind::from(1001)),
+            "event2 should be clustered"
+        );
 
         let (cluster_id_1, similarity_1) = clusters[&Kind::from(1000)];
         let (cluster_id_2, similarity_2) = clusters[&Kind::from(1001)];
 
-        assert_eq!(cluster_id_1, cluster_id_2, "event1 and event2 should be in same cluster");
+        assert_eq!(
+            cluster_id_1, cluster_id_2,
+            "event1 and event2 should be in same cluster"
+        );
 
         // Both should have high similarity scores (>0.9 since they're very similar)
-        assert!(similarity_1 > 0.9, "event1 similarity should be high: {}", similarity_1);
-        assert!(similarity_2 > 0.9, "event2 similarity should be high: {}", similarity_2);
+        assert!(
+            similarity_1 > 0.9,
+            "event1 similarity should be high: {}",
+            similarity_1
+        );
+        assert!(
+            similarity_2 > 0.9,
+            "event2 similarity should be high: {}",
+            similarity_2
+        );
 
         // event3 should NOT be clustered (no similar neighbors)
         assert!(

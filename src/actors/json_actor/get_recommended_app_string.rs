@@ -2,6 +2,19 @@ use anyhow::Result;
 use nostr_sdk::prelude::*;
 use serde_json::Value;
 
+/// Parse recommended app information from NIP-89 event.
+///
+/// Extracts app name and supported kinds from a NIP-89 handler event.
+///
+/// # Returns
+///
+/// Returns tuple of (supported_kinds, app_name).
+///
+/// # Note
+///
+/// Currently unused - recommended app functionality not yet fully implemented.
+/// Kept for future NIP-89 integration.
+#[allow(dead_code)]
 pub fn parse_recommended_app(app_event: &Event) -> Result<(Box<[Kind]>, String)> {
     let alt_tag_data = app_event.tags.iter().find_map(|tag| {
         // Look for alt tags using tag name

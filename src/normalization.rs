@@ -28,16 +28,15 @@ pub fn normalize_content(content: &str) -> String {
     normalized = HEX_ID_RE.replace_all(&normalized, "<HEX_ID>").to_string();
 
     // Replace timestamps
-    normalized = TIMESTAMP_RE.replace_all(&normalized, "<TIMESTAMP>").to_string();
+    normalized = TIMESTAMP_RE
+        .replace_all(&normalized, "<TIMESTAMP>")
+        .to_string();
 
     // Replace URLs (keep structure but remove specific domains/paths)
     normalized = URL_RE.replace_all(&normalized, "<URL>").to_string();
 
     // Normalize whitespace
-    normalized = normalized
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
 
     normalized
 }
@@ -97,7 +96,7 @@ pub struct JsonStructure {
     pub is_object: bool,
     pub is_array: bool,
     pub top_level_key_count: usize,
-    pub nested_key_count: usize,  // Keys 2 levels deep
+    pub nested_key_count: usize, // Keys 2 levels deep
     pub max_nesting_depth: usize,
     pub has_arrays: bool,
     pub string_value_ratio: f32,
@@ -192,7 +191,7 @@ fn check_for_arrays(value: &Value, structure: &mut JsonStructure) {
     }
 }
 
-fn count_value_types(value: &Value, total: &mut usize, counts: &mut [usize; 4], depth: usize) {
+fn count_value_types(value: &Value, total: &mut usize, counts: &mut [usize; 4], _depth: usize) {
     match value {
         Value::String(_) => {
             *total += 1;
@@ -212,12 +211,12 @@ fn count_value_types(value: &Value, total: &mut usize, counts: &mut [usize; 4], 
         }
         Value::Object(obj) => {
             for val in obj.values() {
-                count_value_types(val, total, counts, depth + 1);
+                count_value_types(val, total, counts, _depth + 1);
             }
         }
         Value::Array(arr) => {
             for val in arr {
-                count_value_types(val, total, counts, depth + 1);
+                count_value_types(val, total, counts, _depth + 1);
             }
         }
     }
@@ -240,7 +239,11 @@ mod tests {
         // Use realistic NIP-19 encoded strings (63+ chars, lowercase only like real bech32)
         let content = "Follow npub1234567890abcdef234567890abcdef234567890abcdef234567890abcdef2 and check note1234567890abcdef234567890abcdef234567890abcdef234567890abcdef2";
         let normalized = normalize_content(content);
-        assert!(normalized.contains("<NIP19>"), "Normalized content: {}", normalized);
+        assert!(
+            normalized.contains("<NIP19>"),
+            "Normalized content: {}",
+            normalized
+        );
         assert!(!normalized.contains("npub1"));
         assert!(!normalized.contains("note1"));
     }
@@ -262,8 +265,16 @@ mod tests {
     #[test]
     fn test_normalize_tags() {
         let tags = vec![
-            Tag::parse(["e", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"]).unwrap(),
-            Tag::parse(["p", "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3"]).unwrap(),
+            Tag::parse([
+                "e",
+                "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            ])
+            .unwrap(),
+            Tag::parse([
+                "p",
+                "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
+            ])
+            .unwrap(),
             Tag::parse(["d", "my-identifier"]).unwrap(),
             Tag::parse(["t", "nostr"]).unwrap(),
         ];

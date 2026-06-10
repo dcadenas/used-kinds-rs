@@ -572,7 +572,7 @@
                     <div class="kind-number">
                         <a href="https://github.com/search?q=repo%3Anostr-protocol%2Fnips++%2Fkind.*%5Cb{{this.[0]}}%5Cb%2F&type=code"
                            class="github-link" target="_blank" title="Search in NIPs">
-                            #{{this.[0]}}
+                            Kind {{this.[0]}}
                         </a>
                     </div>
                     <i class="fas fa-chevron-down expand-icon"></i>
@@ -589,9 +589,8 @@
                     {{/if}}
                     {{#if this.[1].cluster_id}}
                     <div class="info-row">
-                        <span class="info-label">Similarity</span>
                         <span class="cluster-badge" data-cluster-id="{{this.[1].cluster_id}}">
-                            Cluster: kind #<span class="cluster-kind-number">{{this.[1].cluster_id}}</span>
+                            Similarity cluster: Kind <span class="cluster-kind-number">{{this.[1].cluster_id}}</span>
                         </span>
                     </div>
                     {{/if}}
