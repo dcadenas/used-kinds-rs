@@ -203,13 +203,21 @@ pub enum NostrActorMessage {
 ///
 /// Takes the `d` tag (the relay's normalized URL), keeps only `wss://`
 /// clearnet hosts, trims trailing slashes so the result compares equal to
-/// the curated lists, and dedupes across monitors preserving order.
+/// the curated lists, and dedupes across monitors. Candidates are
+/// interleaved round-robin across publisher pubkeys (each keeping its own
+/// arrival order) per NIP-66's advice against trusting a single source:
+/// the caller takes only the head of this list, so without the interleave
+/// one misbehaving monitor bursting events would control every pick.
+/// Keys are free, so this bounds a misbehaving publisher, not a
+/// determined sybil — the monitor relays' write policy is the gate there.
 fn relay_urls_from_discovery_events<'a, I>(events: I) -> Vec<String>
 where
     I: IntoIterator<Item = &'a Event>,
 {
     let mut seen = std::collections::HashSet::new();
-    let mut urls = Vec::new();
+    let mut publisher_order = Vec::new();
+    let mut per_publisher: std::collections::HashMap<PublicKey, Vec<String>> =
+        std::collections::HashMap::new();
 
     for event in events {
         let Some(d_value) = event.tags.identifier() else {
@@ -236,7 +244,25 @@ where
 
         let url = d_value.trim_end_matches('/').to_string();
         if seen.insert(url.clone()) {
-            urls.push(url);
+            let relays = per_publisher.entry(event.pubkey).or_default();
+            if relays.is_empty() {
+                publisher_order.push(event.pubkey);
+            }
+            relays.push(url);
+        }
+    }
+
+    let mut urls = Vec::with_capacity(seen.len());
+    for round in 0.. {
+        let mut exhausted = true;
+        for publisher in &publisher_order {
+            if let Some(url) = per_publisher.get(publisher).and_then(|r| r.get(round)) {
+                urls.push(url.clone());
+                exhausted = false;
+            }
+        }
+        if exhausted {
+            break;
         }
     }
 
@@ -552,13 +578,16 @@ impl Actor for NostrActor {
 mod tests {
     use super::*;
 
-    fn discovery_event(d_value: &str) -> Event {
-        let keys = Keys::generate();
+    fn discovery_event_signed_by(keys: &Keys, d_value: &str) -> Event {
         let unsigned = EventBuilder::new(Kind::from(30166u16), "")
             .tag(Tag::identifier(d_value))
             .build(keys.public_key());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async { keys.sign_event(unsigned).await.unwrap() })
+    }
+
+    fn discovery_event(d_value: &str) -> Event {
+        discovery_event_signed_by(&Keys::generate(), d_value)
     }
 
     #[test]
@@ -592,6 +621,38 @@ mod tests {
         assert_eq!(
             relay_urls_from_discovery_events(events.iter()),
             vec!["wss://good.relay.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_relay_urls_interleave_across_monitor_pubkeys() {
+        // One flooding publisher must not own the list head: downstream
+        // takes only the first 5 candidates, so without interleaving a
+        // single pubkey bursting events controls every rotation pick.
+        let flood = Keys::generate();
+        let honest = Keys::generate();
+        let mut events = Vec::new();
+        for i in 0..10 {
+            events.push(discovery_event_signed_by(
+                &flood,
+                &format!("wss://flood{i}.example"),
+            ));
+        }
+        events.push(discovery_event_signed_by(&honest, "wss://honest1.example"));
+        events.push(discovery_event_signed_by(&honest, "wss://honest2.example"));
+
+        let urls = relay_urls_from_discovery_events(events.iter());
+        assert_eq!(urls.len(), 12, "no relay is dropped, only reordered");
+        assert_eq!(
+            &urls[..5],
+            &[
+                "wss://flood0.example".to_string(),
+                "wss://honest1.example".to_string(),
+                "wss://flood1.example".to_string(),
+                "wss://honest2.example".to_string(),
+                // honest publisher exhausted; flood fills the tail
+                "wss://flood2.example".to_string(),
+            ]
         );
     }
 
