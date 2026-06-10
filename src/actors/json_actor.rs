@@ -2,6 +2,7 @@ mod get_recommended_app_string;
 use super::nostr_actor::NostrActorMessage;
 use crate::actors::http_actor::{HttpActor, HttpActorMessage};
 use crate::utils::is_kind_free;
+use crate::utils::is_old;
 use crate::utils::should_log;
 use anyhow::Result;
 use chrono::Utc;
@@ -72,10 +73,6 @@ impl State {
 
         Ok(())
     }
-}
-
-fn is_old(unix_time: i64) -> bool {
-    unix_time < (Utc::now() - chrono::Duration::days(30)).timestamp_millis()
 }
 
 /// Cosine score two kinds must reach to be clustered together. Recalibrate
@@ -402,11 +399,19 @@ impl Actor for JsonActor {
 
         info!("Qdrant client initialized successfully");
 
-        // Migrate stats.json on first startup
+        // Migrate stats.json on first startup. A failure here must fail the
+        // boot: once anything lands in the collection, the point-count guard
+        // skips migration forever, so the only safe retry window is while
+        // the collection is still empty. Parse failures are handled inside
+        // (logged and skipped — they leave no partial state).
         match crate::qdrant_client::migrate_from_stats_json(&qdrant_client, &STATS_FILE).await {
             Ok(true) => info!("Completed one-time migration from stats.json to Qdrant"),
             Ok(false) => info!("No migration needed"),
-            Err(e) => error!("Migration failed (continuing anyway): {}", e),
+            Err(e) => {
+                return Err(ActorProcessingErr::from(format!(
+                    "Migration from stats.json failed: {e}"
+                )))
+            }
         }
 
         // Bring stored vectors up to the current featurizer version

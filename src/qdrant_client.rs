@@ -77,8 +77,37 @@ pub fn vector_size() -> usize {
     VECTOR_SIZE as usize
 }
 
+/// Whether a stats.json entry is still worth importing: fresh and its kind
+/// still undocumented. Anything else would be deleted by the next
+/// CleanupDocumentedKinds pass, so importing it only creates churn.
+fn is_importable(
+    kind: nostr_sdk::prelude::Kind,
+    entry: &crate::actors::json_actor::KindEntry,
+) -> bool {
+    !crate::utils::is_old(entry.last_updated) && crate::utils::is_kind_free(kind)
+}
+
+/// Rename stats.json so later boots do not re-attempt migration.
+async fn mark_stats_json_migrated(stats_file: &str) {
+    let backup_path = format!("{}.migrated", stats_file);
+    if let Err(e) = tokio::fs::rename(stats_file, &backup_path).await {
+        info!("Could not rename {}: {}", stats_file, e);
+    } else {
+        info!("Renamed {} to {}", stats_file, backup_path);
+    }
+}
+
 /// Import stats.json into Qdrant if this is the first startup
 /// Returns true if migration was performed
+///
+/// # Errors
+///
+/// Fails only past the parse stage (collection lookup or bulk upsert). The
+/// caller must treat that as fatal: the collection is still empty, so a
+/// restart retries the import, while continuing would let the point-count
+/// guard skip migration forever. A parse failure means stats.json is
+/// corrupt; it leaves no partial state and recurs identically, so it logs
+/// and skips instead of failing the boot.
 pub async fn migrate_from_stats_json(client: &Qdrant, stats_file: &str) -> Result<bool> {
     use crate::actors::json_actor::KindEntry;
     use crate::similarity::EventFeatures;
@@ -109,23 +138,40 @@ pub async fn migrate_from_stats_json(client: &Qdrant, stats_file: &str) -> Resul
         }
     };
 
-    // Parse stats.json
-    let kind_stats: HashMap<Kind, KindEntry> =
-        serde_json::from_str(&json_str).context("Failed to parse stats.json")?;
+    let kind_stats: HashMap<Kind, KindEntry> = match serde_json::from_str(&json_str) {
+        Ok(stats) => stats,
+        Err(e) => {
+            tracing::error!("stats.json is unparseable, skipping migration: {}", e);
+            return Ok(false);
+        }
+    };
 
     if kind_stats.is_empty() {
         info!("stats.json is empty, nothing to migrate");
         return Ok(false);
     }
 
+    let total = kind_stats.len();
+    let importable: Vec<(Kind, KindEntry)> = kind_stats
+        .into_iter()
+        .filter(|(kind, entry)| is_importable(*kind, entry))
+        .collect();
+
     info!(
-        "Migrating {} events from stats.json to Qdrant...",
-        kind_stats.len()
+        "Importing {} of {} stats.json entries ({} skipped as stale or documented)",
+        importable.len(),
+        total,
+        total - importable.len()
     );
+
+    if importable.is_empty() {
+        mark_stats_json_migrated(stats_file).await;
+        return Ok(false);
+    }
 
     // Convert to Qdrant points
     let mut points = Vec::new();
-    for (kind, entry) in &kind_stats {
+    for (kind, entry) in &importable {
         let features = EventFeatures::from_event(&entry.event);
         let vector = features.to_vector();
 
@@ -153,19 +199,10 @@ pub async fn migrate_from_stats_json(client: &Qdrant, stats_file: &str) -> Resul
 
     info!(
         "Successfully migrated {} events to Qdrant",
-        kind_stats.len()
+        importable.len()
     );
 
-    // Rename stats.json to mark migration complete
-    let backup_path = format!("{}.migrated", stats_file);
-    if let Err(e) = tokio::fs::rename(stats_file, &backup_path).await {
-        info!(
-            "Could not rename stats.json: {}. Migration complete anyway.",
-            e
-        );
-    } else {
-        info!("Renamed stats.json to {}", backup_path);
-    }
+    mark_stats_json_migrated(stats_file).await;
 
     Ok(true)
 }
@@ -263,6 +300,154 @@ pub fn payload_to_kind_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actors::json_actor::KindEntry;
+    use nostr_sdk::prelude::*;
+
+    async fn signed_event_async(kind: u16) -> Event {
+        let keys = Keys::generate();
+        let unsigned = EventBuilder::new(Kind::from(kind), "{}").build(keys.public_key());
+        keys.sign_event(unsigned).await.unwrap()
+    }
+
+    fn kind_entry_from(event: Event, last_updated: i64) -> KindEntry {
+        KindEntry {
+            event,
+            count: 1,
+            last_updated,
+            recommended_app: None,
+            recommended_app_event: None,
+            cluster_id: None,
+            cluster_similarity: None,
+        }
+    }
+
+    // For sync #[test]s; inside #[tokio::test] use kind_entry_async (a
+    // nested runtime panics).
+    fn kind_entry(kind: u16, last_updated: i64) -> KindEntry {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let event = rt.block_on(signed_event_async(kind));
+        kind_entry_from(event, last_updated)
+    }
+
+    async fn kind_entry_async(kind: u16, last_updated: i64) -> KindEntry {
+        kind_entry_from(signed_event_async(kind).await, last_updated)
+    }
+
+    #[test]
+    fn test_is_importable_keeps_fresh_undocumented_kinds() {
+        let now = chrono::Utc::now().timestamp_millis();
+        // 64999 is not in the documented-kinds list or ranges
+        let entry = kind_entry(64999, now);
+        assert!(is_importable(Kind::from(64999u16), &entry));
+    }
+
+    #[test]
+    fn test_is_importable_drops_stale_entries() {
+        let stale =
+            chrono::Utc::now().timestamp_millis() - chrono::Duration::days(31).num_milliseconds();
+        let entry = kind_entry(64999, stale);
+        assert!(
+            !is_importable(Kind::from(64999u16), &entry),
+            "an entry older than 30 days would be deleted by the next cleanup pass"
+        );
+    }
+
+    #[test]
+    fn test_is_importable_drops_documented_kinds() {
+        let now = chrono::Utc::now().timestamp_millis();
+        // Kind 1 is documented in every NIPs list including the static fallback
+        let entry = kind_entry(1, now);
+        assert!(
+            !is_importable(Kind::from(1u16), &entry),
+            "a documented kind would be deleted by the next cleanup pass"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Needs a local Qdrant whose nostr_events collection is EMPTY; run alone:
+              // cargo test test_migrate_filters -- --ignored
+    async fn test_migrate_filters_stale_and_documented_entries() {
+        use qdrant_client::qdrant::{DeletePointsBuilder, GetPointsBuilder, PointId};
+
+        let client = initialize_qdrant().await.unwrap();
+
+        let info = client.collection_info(COLLECTION_NAME).await.unwrap();
+        let points = info.result.and_then(|r| r.points_count).unwrap_or(0);
+        assert_eq!(
+            points, 0,
+            "this test needs an empty collection: migration short-circuits when points exist"
+        );
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let stale = now - chrono::Duration::days(31).num_milliseconds();
+
+        let dir = std::env::temp_dir().join(format!("uk-migrate-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stats_path = dir.join("stats.json");
+        let stats_file = stats_path.to_str().unwrap();
+
+        // Phase 1: every entry skippable -> no upsert, but the file is
+        // still renamed so the next boot does not retry.
+        let mut all_skipped: HashMap<Kind, KindEntry> = HashMap::new();
+        all_skipped.insert(Kind::from(64998u16), kind_entry_async(64998, stale).await);
+        all_skipped.insert(Kind::from(1u16), kind_entry_async(1, now).await);
+        std::fs::write(&stats_path, serde_json::to_string(&all_skipped).unwrap()).unwrap();
+
+        let migrated = migrate_from_stats_json(&client, stats_file).await.unwrap();
+        assert!(!migrated, "nothing importable -> no migration");
+        assert!(!stats_path.exists(), "stats.json must still be renamed");
+        assert!(dir.join("stats.json.migrated").exists());
+        let info = client.collection_info(COLLECTION_NAME).await.unwrap();
+        assert_eq!(info.result.and_then(|r| r.points_count).unwrap_or(0), 0);
+
+        // Phase 2: mixed file -> only the fresh undocumented kind lands.
+        let mut mixed: HashMap<Kind, KindEntry> = HashMap::new();
+        mixed.insert(Kind::from(64999u16), kind_entry_async(64999, now).await);
+        mixed.insert(Kind::from(64998u16), kind_entry_async(64998, stale).await);
+        mixed.insert(Kind::from(1u16), kind_entry_async(1, now).await);
+        std::fs::write(&stats_path, serde_json::to_string(&mixed).unwrap()).unwrap();
+
+        let migrated = migrate_from_stats_json(&client, stats_file).await.unwrap();
+        assert!(migrated);
+
+        let got = client
+            .get_points(
+                GetPointsBuilder::new(
+                    COLLECTION_NAME,
+                    vec![
+                        PointId::from(64999u64),
+                        PointId::from(64998u64),
+                        PointId::from(1u64),
+                    ],
+                )
+                .build(),
+            )
+            .await
+            .unwrap();
+        let ids: Vec<u64> = got
+            .result
+            .iter()
+            .filter_map(|p| match p.id.as_ref()?.point_id_options.as_ref()? {
+                qdrant_client::qdrant::point_id::PointIdOptions::Num(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![64999],
+            "only the fresh undocumented kind is imported"
+        );
+
+        client
+            .delete_points(
+                DeletePointsBuilder::new(COLLECTION_NAME)
+                    .points(vec![PointId::from(64999u64)])
+                    .build(),
+            )
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[tokio::test]
     #[ignore] // Only run when Qdrant is available locally
