@@ -80,7 +80,12 @@ fn is_old(unix_time: i64) -> bool {
 
 /// Cosine score two kinds must reach to be clustered together. Recalibrate
 /// against the logged best-neighbor histogram whenever the featurizer changes.
-const CLUSTER_SIMILARITY_THRESHOLD: f32 = 0.8;
+///
+/// 0.9 sits in the valley of the featurizer-v2 distribution: of 234 seeds,
+/// only 2 scored in [0.9, 0.95) while 109 scored >= 0.95, so it separates
+/// same-codebase near-duplicates from coincidental similarity (at 0.8 about
+/// 92% of all kinds ended up clustered, which made the badge meaningless).
+const CLUSTER_SIMILARITY_THRESHOLD: f32 = 0.9;
 
 /// Whether a stored point was vectorized with an older featurizer version.
 fn payload_needs_revectorization(payload: &HashMap<String, qdrant_client::qdrant::Value>) -> bool {
