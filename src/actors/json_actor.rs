@@ -89,6 +89,29 @@ fn is_old(unix_time: i64) -> bool {
 /// showed the same valley.
 const CLUSTER_SIMILARITY_THRESHOLD: f32 = 0.9;
 
+/// Outcome of fetching a kind's stored point before an update.
+enum StoredPoint {
+    /// The point exists; the update must preserve its history.
+    Existing(Box<qdrant_client::qdrant::RetrievedPoint>),
+    /// Confirmed absent: the count=1 new-point path is safe.
+    New,
+    /// Fetch failed: skip the update rather than risk resetting count and
+    /// EMA history by treating an unreadable point as new.
+    Unavailable(String),
+}
+
+fn classify_stored_point<E: std::fmt::Display>(
+    result: Result<Vec<qdrant_client::qdrant::RetrievedPoint>, E>,
+) -> StoredPoint {
+    match result {
+        Ok(points) => match points.into_iter().next() {
+            Some(point) => StoredPoint::Existing(Box::new(point)),
+            None => StoredPoint::New,
+        },
+        Err(e) => StoredPoint::Unavailable(e.to_string()),
+    }
+}
+
 /// Cluster id for a new point joining via the incremental path: the
 /// neighbor's cluster if it already has one, otherwise derived from the two
 /// founding members. Batch clustering uses the lowest member kind as the
@@ -480,11 +503,22 @@ impl Actor for JsonActor {
                             .with_vectors(true)
                             .build();
 
-                    let current_point = client_clone
+                    let fetched = client_clone
                         .get_points(get_request)
                         .await
-                        .ok()
-                        .and_then(|resp| resp.result.first().cloned());
+                        .map(|resp| resp.result);
+
+                    let current_point = match classify_stored_point(fetched) {
+                        StoredPoint::Existing(point) => Some(*point),
+                        StoredPoint::New => None,
+                        StoredPoint::Unavailable(e) => {
+                            error!(
+                                "Failed to fetch stored point for kind {}, skipping this event: {}",
+                                kind_u16, e
+                            );
+                            return;
+                        }
+                    };
 
                     let is_new_event = current_point.is_none();
 
@@ -1046,6 +1080,24 @@ impl Actor for JsonActor {
 mod tests {
     use super::*;
     use qdrant_client::qdrant::Value;
+
+    #[test]
+    fn test_classify_stored_point_distinguishes_error_from_absent() {
+        let existing = classify_stored_point::<String>(Ok(vec![
+            qdrant_client::qdrant::RetrievedPoint::default(),
+        ]));
+        assert!(matches!(existing, StoredPoint::Existing(_)));
+
+        let absent = classify_stored_point::<String>(Ok(vec![]));
+        assert!(matches!(absent, StoredPoint::New));
+
+        let failed = classify_stored_point(Err("connection refused".to_string()));
+        assert!(
+            matches!(failed, StoredPoint::Unavailable(_)),
+            "a fetch error must not be treated as a confirmed-new point: \
+             the count=1 path would overwrite the stored count and EMA vector"
+        );
+    }
 
     #[test]
     fn test_incremental_cluster_id_prefers_neighbor_cluster() {
