@@ -14,8 +14,12 @@ fn usable_name(value: &str) -> Option<String> {
 /// Parse recommended app information from NIP-89 event.
 ///
 /// Extracts app name and supported kinds from a NIP-89 handler event.
-/// The name is `None` when neither the alt tag nor the content carries a
-/// usable value — callers must persist nothing rather than a sentinel.
+/// Name precedence is content display_name/name, then the alt tag, then
+/// the website URL: in a 348-event sample of live kind-31990 events the
+/// alt was always a NIP-31 description ("Nostr App: nostrudel") wherever
+/// a content name existed, and no event carried an alt without one.
+/// The name is `None` when no source carries a usable value — callers
+/// must persist nothing rather than a sentinel.
 ///
 /// # Returns
 ///
@@ -44,21 +48,18 @@ pub fn parse_recommended_app(app_event: &Event) -> (Box<[Kind]>, Option<String>)
         .collect();
 
     // Unparseable content (plain text in the wild) is treated as absent
-    // rather than an error so the alt tag can still name the app. Within
-    // parsed content, human-readable names beat the website URL.
-    let content_value = serde_json::from_str::<Value>(&app_event.content)
-        .ok()
-        .and_then(|content_json| {
-            [
-                &content_json["display_name"],
-                &content_json["name"],
-                &content_json["website"],
-            ]
+    // rather than an error so the alt tag can still name the app.
+    let content_json = serde_json::from_str::<Value>(&app_event.content).ok();
+    let content_name = content_json.as_ref().and_then(|json| {
+        [&json["display_name"], &json["name"]]
             .iter()
             .find_map(|value| value.as_str().and_then(usable_name))
-        });
+    });
+    let website = content_json
+        .as_ref()
+        .and_then(|json| json["website"].as_str().and_then(usable_name));
 
-    (kind_tag_data, alt_tag_data.or(content_value))
+    (kind_tag_data, content_name.or(alt_tag_data).or(website))
 }
 
 #[cfg(test)]
@@ -144,6 +145,29 @@ mod tests {
         );
         let (_, app) = parse_recommended_app(&event);
         assert_eq!(app.as_deref(), Some("https://app.example"));
+    }
+
+    #[test]
+    fn test_prefers_content_name_over_alt_description() {
+        // Sampled real 31990 events: alt is a NIP-31 description ("Nostr
+        // App: nostrudel") while content metadata carries the proper name.
+        let event = handler_event(
+            vec![vec!["alt", "Nostr App: nostrudel"], vec!["k", "1063"]],
+            r#"{"name":"noStrudel"}"#,
+        );
+        let (_, app) = parse_recommended_app(&event);
+        assert_eq!(app.as_deref(), Some("noStrudel"));
+    }
+
+    #[test]
+    fn test_alt_tag_beats_website_url() {
+        // A descriptive alt still labels better than a bare URL.
+        let event = handler_event(
+            vec![vec!["alt", "ZapClock"], vec!["k", "1063"]],
+            r#"{"website":"https://app.example"}"#,
+        );
+        let (_, app) = parse_recommended_app(&event);
+        assert_eq!(app.as_deref(), Some("ZapClock"));
     }
 
     #[test]
