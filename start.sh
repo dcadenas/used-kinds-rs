@@ -5,6 +5,11 @@
 # qdrant to launch or supervise: wait for that one, then become the app.
 set -u
 
+# How long to wait for qdrant to accept connections. The old hard-coded 60s
+# was not enough for a WAL replay on a slow disk after an unclean stop; a
+# too-short cap turns one slow boot into a restart loop that never recovers.
+ready_timeout="${QDRANT_READY_TIMEOUT_SECS:-300}"
+
 # Parse host and port out of QDRANT_URL; scheme and path are optional.
 qdrant_url="${QDRANT_URL:-http://127.0.0.1:6334}"
 hostport="${qdrant_url#*://}"
@@ -16,14 +21,14 @@ if [ "$qdrant_port" = "$qdrant_host" ]; then
 fi
 
 if [ "$qdrant_host" != "127.0.0.1" ] && [ "$qdrant_host" != "localhost" ]; then
-    echo "Waiting for external qdrant at $qdrant_host:$qdrant_port"
-    for _ in $(seq 1 60); do
+    echo "Waiting for external qdrant at $qdrant_host:$qdrant_port (timeout ${ready_timeout}s)"
+    for _ in $(seq 1 "$ready_timeout"); do
         if (exec 3<>"/dev/tcp/$qdrant_host/$qdrant_port") 2>/dev/null; then
             exec /used-kinds-rs
         fi
         sleep 1
     done
-    echo "qdrant at $qdrant_host:$qdrant_port not ready after 60s, giving up" >&2
+    echo "qdrant at $qdrant_host:$qdrant_port not ready after ${ready_timeout}s, giving up" >&2
     exit 1
 fi
 
@@ -53,7 +58,7 @@ die() {
 # Wait for qdrant to accept gRPC connections before starting the app;
 # the app hard-fails at startup if qdrant is unreachable.
 ready=""
-for _ in $(seq 1 60); do
+for _ in $(seq 1 "$ready_timeout"); do
     if (exec 3<>/dev/tcp/127.0.0.1/6334) 2>/dev/null; then
         ready=1
         break
@@ -64,7 +69,7 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 if [ -z "$ready" ]; then
-    die 1 "qdrant not ready after 60s, giving up"
+    die 1 "qdrant not ready after ${ready_timeout}s, giving up"
 fi
 
 /used-kinds-rs &
