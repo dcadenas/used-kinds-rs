@@ -7,7 +7,63 @@ use std::collections::{HashMap, HashSet};
 /// Stored in every Qdrant point payload; bump it whenever the vector layout
 /// or any feature computation changes so stored points get re-vectorized at
 /// startup. Mixing vectors from different schemes makes similarity garbage.
-pub const FEATURE_VERSION: i64 = 1;
+pub const FEATURE_VERSION: i64 = 2;
+
+// 64-dim vector layout. Each family is normalized to unit energy before the
+// global normalization so no family can drown the others.
+pub const TAG_NAME_DIMS: usize = 20; // 0..20
+pub const TAG_PATTERN_DIMS: usize = 10; // 20..30
+pub const JSON_KEY_DIMS: usize = 14; // 30..44
+pub const ENCODING_DIMS: usize = 4; // 44..48
+pub const CONTENT_DIMS: usize = 8; // 48..56
+pub const JSON_SHAPE_DIMS: usize = 8; // 56..64
+
+/// FNV-1a (32-bit). Deliberately hand-rolled: bucket assignments persist in
+/// Qdrant, and std's DefaultHasher is not stable across Rust releases.
+fn fnv1a_32(s: &str) -> u32 {
+    let mut hash: u32 = 0x811c9dc5;
+    for byte in s.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
+}
+
+/// Weight for a tag name bucket. Ubiquitous standard single-letter tags
+/// appear in most kinds and carry little cluster signal.
+fn tag_weight(tag_name: &str) -> f32 {
+    match tag_name {
+        "e" | "p" | "d" | "a" | "t" => 0.3,
+        _ => 1.0,
+    }
+}
+
+/// Scale a feature family to unit energy so every family gets an equal vote
+/// in the cosine; without this a kind with many tags drowns its content.
+fn normalize_family(family: &mut [f32]) {
+    let magnitude: f32 = family.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if magnitude > 0.0 {
+        family.iter_mut().for_each(|x| *x /= magnitude);
+    }
+}
+
+/// Blend a stored vector with a fresh one (exponential moving average) so a
+/// kind's fingerprint reflects its typical event, not just the latest one.
+/// Returns a unit-length vector.
+pub fn blend_vectors(old: &[f32], fresh: &[f32], keep: f32) -> Vec<f32> {
+    let mut blended: Vec<f32> = old
+        .iter()
+        .zip(fresh.iter())
+        .map(|(o, f)| keep * o + (1.0 - keep) * f)
+        .collect();
+
+    let magnitude: f32 = blended.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if magnitude > 0.0 {
+        blended.iter_mut().for_each(|x| *x /= magnitude);
+    }
+
+    blended
+}
 
 /// Feature vector extracted from an event for similarity comparison
 #[derive(Debug, Clone)]
@@ -33,126 +89,110 @@ impl EventFeatures {
 
     /// Convert features to a dense vector for Qdrant storage.
     ///
-    /// Vector dimension: 64
-    /// - 0-31: Feature-hashed tag names (32 buckets)
-    /// - 32-35: Content encoding detection
-    /// - 36-63: Content structure features
+    /// 64 dims in six families (see the layout constants), each family
+    /// normalized to unit energy, then the whole vector normalized for
+    /// cosine distance. Bump [`FEATURE_VERSION`] when changing anything here.
     pub fn to_vector(&self) -> Vec<f32> {
         let mut vector = Vec::with_capacity(crate::qdrant_client::vector_size());
 
-        // ===== TAG FEATURES (0-31): Feature hashing =====
-        // Extract unique tag names and hash to 32 buckets
-        let mut tag_buckets = [0.0f32; 32];
+        // Tag name and tag pattern banks. The pattern keeps the value
+        // structure ("d:<HEX_ID>" vs "d:value"), which the name bank drops.
+        let mut tag_names = [0.0f32; TAG_NAME_DIMS];
+        let mut tag_patterns = [0.0f32; TAG_PATTERN_DIMS];
 
-        let unique_tag_names: HashSet<String> = self
-            .tag_patterns
-            .iter()
-            .filter_map(|pattern| {
-                // Extract tag name (before first ':')
-                pattern.split(':').next().map(String::from)
-            })
-            .collect();
+        for pattern in &self.tag_patterns {
+            let name = pattern.split(':').next().unwrap_or(pattern);
+            let weight = tag_weight(name);
 
-        for tag_name in unique_tag_names {
-            // Simple hash: sum of char codes modulo 32
-            let hash = tag_name.chars().map(|c| c as u32).sum::<u32>() % 32;
-            tag_buckets[hash as usize] = 1.0;
+            let name_bucket = (fnv1a_32(name) as usize) % TAG_NAME_DIMS;
+            tag_names[name_bucket] = tag_names[name_bucket].max(weight);
+
+            let pattern_bucket = (fnv1a_32(pattern) as usize) % TAG_PATTERN_DIMS;
+            tag_patterns[pattern_bucket] = tag_patterns[pattern_bucket].max(weight);
         }
 
-        vector.extend_from_slice(&tag_buckets);
+        normalize_family(&mut tag_names);
+        normalize_family(&mut tag_patterns);
+        vector.extend_from_slice(&tag_names);
+        vector.extend_from_slice(&tag_patterns);
 
-        // ===== CONTENT ENCODING DETECTION (32-35): 4 dimensions =====
+        // JSON top-level key names: the strongest "same codebase wrote this"
+        // signal available without semantics. Shape stats alone cannot tell
+        // {"cost","cpu"} from {"name","about"}.
+        let json_struct = analyze_json_structure(&self.normalized_content);
+
+        let mut json_keys = [0.0f32; JSON_KEY_DIMS];
+        for key in &json_struct.top_level_keys {
+            json_keys[(fnv1a_32(key) as usize) % JSON_KEY_DIMS] = 1.0;
+        }
+        normalize_family(&mut json_keys);
+        vector.extend_from_slice(&json_keys);
+
+        // Content encoding profile
         let content = &self.normalized_content;
         let content_len = content.len() as f32;
+        let mut encoding = [0.0f32; ENCODING_DIMS];
 
         if content_len > 0.0 {
-            // Hex-only ratio (0-9a-f characters)
             let hex_chars = content.chars().filter(|c| c.is_ascii_hexdigit()).count() as f32;
-            let hex_ratio = hex_chars / content_len;
-
-            // Base64-like ratio (A-Za-z0-9+/= characters)
             let base64_chars = content
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '+' || *c == '/' || *c == '=')
                 .count() as f32;
-            let base64_ratio = base64_chars / content_len;
-
-            // Alphabetic ratio (works for all languages: Chinese, Spanish, etc.)
             let alpha_chars = content.chars().filter(|c| c.is_alphabetic()).count() as f32;
-            let alpha_ratio = alpha_chars / content_len;
-
-            // Character diversity (unique chars / total chars)
             let unique_chars = content.chars().collect::<HashSet<_>>().len() as f32;
-            let char_diversity = unique_chars / content_len;
 
-            vector.push(hex_ratio);
-            vector.push(base64_ratio);
-            vector.push(alpha_ratio);
-            vector.push(char_diversity);
-        } else {
-            // Empty content
-            vector.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
+            encoding[0] = hex_chars / content_len;
+            encoding[1] = base64_chars / content_len;
+            encoding[2] = alpha_chars / content_len;
+            encoding[3] = unique_chars / content_len;
         }
+        normalize_family(&mut encoding);
+        vector.extend_from_slice(&encoding);
 
-        // ===== CONTENT STRUCTURE (36-39): 4 dimensions =====
-        vector.push((content_len / 1000.0).min(1.0)); // Normalized length (0-1000 chars)
-        vector.push(if content_len == 0.0 { 1.0 } else { 0.0 }); // Empty content
-        vector.push(if content_len > 500.0 { 1.0 } else { 0.0 }); // Long content
-        vector.push(if content_len > 100.0 && content_len < 500.0 {
+        // Content structure: size profile plus normalized-placeholder flags
+        let mut content_structure = [0.0f32; CONTENT_DIMS];
+        content_structure[0] = (content_len / 1000.0).min(1.0);
+        content_structure[1] = if content_len == 0.0 { 1.0 } else { 0.0 };
+        content_structure[2] = if content_len > 500.0 { 1.0 } else { 0.0 };
+        content_structure[3] = if content_len > 100.0 && content_len < 500.0 {
             1.0
         } else {
             0.0
-        }); // Medium content
-
-        // Content pattern features
-        let has_hex_id = self.normalized_content.contains("<HEX_ID>");
-        let has_nip19 = self.normalized_content.contains("<NIP19>");
-        let has_timestamp = self.normalized_content.contains("<TIMESTAMP>");
-        let has_url = self.normalized_content.contains("<URL>");
-
-        vector.push(if has_hex_id { 1.0 } else { 0.0 });
-        vector.push(if has_nip19 { 1.0 } else { 0.0 });
-        vector.push(if has_timestamp { 1.0 } else { 0.0 });
-        vector.push(if has_url { 1.0 } else { 0.0 });
-
-        // Word count buckets (next 5 dimensions)
-        let word_count = self.normalized_content.split_whitespace().count() as f32;
-        vector.push(if word_count == 0.0 { 1.0 } else { 0.0 });
-        vector.push(if word_count > 0.0 && word_count <= 10.0 {
+        };
+        content_structure[4] = if content.contains("<HEX_ID>") {
             1.0
         } else {
             0.0
-        });
-        vector.push(if word_count > 10.0 && word_count <= 50.0 {
+        };
+        content_structure[5] = if content.contains("<NIP19>") {
             1.0
         } else {
             0.0
-        });
-        vector.push(if word_count > 50.0 && word_count <= 200.0 {
+        };
+        content_structure[6] = if content.contains("<TIMESTAMP>") {
             1.0
         } else {
             0.0
-        });
-        vector.push(if word_count > 200.0 { 1.0 } else { 0.0 });
+        };
+        content_structure[7] = if content.contains("<URL>") { 1.0 } else { 0.0 };
+        normalize_family(&mut content_structure);
+        vector.extend_from_slice(&content_structure);
 
-        // Adaptive JSON structure features (10 dimensions)
-        let json_struct = analyze_json_structure(&self.normalized_content);
+        // JSON shape
+        let mut json_shape = [0.0f32; JSON_SHAPE_DIMS];
+        json_shape[0] = if json_struct.is_valid_json { 1.0 } else { 0.0 };
+        json_shape[1] = if json_struct.is_object { 1.0 } else { 0.0 };
+        json_shape[2] = if json_struct.is_array { 1.0 } else { 0.0 };
+        json_shape[3] = (json_struct.top_level_key_count as f32 / 20.0).min(1.0);
+        json_shape[4] = (json_struct.nested_key_count as f32 / 50.0).min(1.0);
+        json_shape[5] = (json_struct.max_nesting_depth as f32 / 5.0).min(1.0);
+        json_shape[6] = if json_struct.has_arrays { 1.0 } else { 0.0 };
+        json_shape[7] = json_struct.string_value_ratio;
+        normalize_family(&mut json_shape);
+        vector.extend_from_slice(&json_shape);
 
-        vector.push(if json_struct.is_valid_json { 1.0 } else { 0.0 });
-        vector.push(if json_struct.is_object { 1.0 } else { 0.0 });
-        vector.push(if json_struct.is_array { 1.0 } else { 0.0 });
-        vector.push((json_struct.top_level_key_count as f32 / 20.0).min(1.0)); // Normalized 0-20 keys
-        vector.push((json_struct.nested_key_count as f32 / 50.0).min(1.0)); // Normalized 0-50 nested keys
-        vector.push((json_struct.max_nesting_depth as f32 / 5.0).min(1.0)); // Normalized 0-5 depth
-        vector.push(if json_struct.has_arrays { 1.0 } else { 0.0 });
-        vector.push(json_struct.string_value_ratio);
-        vector.push(json_struct.number_value_ratio);
-        vector.push(json_struct.bool_value_ratio);
-
-        // Padding to reach exactly 64 dimensions
-        while vector.len() < crate::qdrant_client::vector_size() {
-            vector.push(0.0);
-        }
+        debug_assert_eq!(vector.len(), crate::qdrant_client::vector_size());
 
         // Normalize to unit length (required for Cosine distance)
         let magnitude: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -316,6 +356,137 @@ pub fn cluster_kinds(events: &HashMap<Kind, &Event>, threshold: f64) -> HashMap<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    }
+
+    fn squared_energy(slice: &[f32]) -> f32 {
+        slice.iter().map(|x| x * x).sum()
+    }
+
+    fn features(tag_patterns: &[&str], content: &str) -> EventFeatures {
+        EventFeatures {
+            tag_patterns: tag_patterns.iter().map(|s| s.to_string()).collect(),
+            normalized_content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_fnv1a_distinguishes_anagrams() {
+        assert_ne!(fnv1a_32("ab"), fnv1a_32("ba"));
+        assert_ne!(fnv1a_32("listen"), fnv1a_32("silent"));
+        // FNV-1a offset basis for the empty string; pins the algorithm.
+        assert_eq!(fnv1a_32(""), 0x811c9dc5);
+    }
+
+    #[test]
+    fn test_tag_weight_downweights_standard_single_letter_tags() {
+        for standard in ["e", "p", "d", "a", "t"] {
+            assert!(
+                tag_weight(standard) < 0.5,
+                "tag {} should be light",
+                standard
+            );
+        }
+        assert_eq!(tag_weight("imeta"), 1.0);
+        assert_eq!(tag_weight("emoji"), 1.0);
+    }
+
+    #[test]
+    fn test_to_vector_is_64_dims_and_unit_length() {
+        let f = features(&["e:<HEX_ID>", "imeta:<LONG_VALUE>"], r#"{"a":1}"#);
+        let v = f.to_vector();
+        assert_eq!(v.len(), 64);
+        let magnitude: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((magnitude - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_json_key_names_discriminate_same_shape_payloads() {
+        // Identical shape, value types, lengths, and char multisets (anagram
+        // keys) — only the key names differ. These must not look identical.
+        let f1 = features(&[], r#"{"listen":1,"stream":"x"}"#);
+        let f2 = features(&[], r#"{"silent":1,"master":"x"}"#);
+
+        let similarity = cosine(&f1.to_vector(), &f2.to_vector());
+        assert!(
+            similarity < 0.95,
+            "different key vocabularies should not be near-identical, got {}",
+            similarity
+        );
+
+        // Same keys → near identical.
+        let f3 = features(&[], r#"{"listen":2,"stream":"y"}"#);
+        let same = cosine(&f1.to_vector(), &f3.to_vector());
+        assert!(
+            same > 0.99,
+            "same key vocabulary should match, got {}",
+            same
+        );
+    }
+
+    #[test]
+    fn test_tag_value_types_distinguish_kinds() {
+        let f1 = features(&["d:<HEX_ID>"], "");
+        let f2 = features(&["d:value"], "");
+
+        let similarity = cosine(&f1.to_vector(), &f2.to_vector());
+        assert!(
+            similarity < 0.999,
+            "same tag name with different value structure should differ, got {}",
+            similarity
+        );
+    }
+
+    #[test]
+    fn test_family_energies_are_balanced() {
+        // Many tag types must not drown the JSON shape family.
+        let f = features(
+            &[
+                "imeta:<URL>",
+                "emoji:value",
+                "title:value",
+                "alt:value",
+                "subject:value",
+                "client:value",
+                "expiration:<TIMESTAMP>",
+                "relays:value",
+            ],
+            r#"{"a":1,"b":"x","c":true}"#,
+        );
+        let v = f.to_vector();
+
+        let tag_energy = squared_energy(&v[0..TAG_NAME_DIMS]);
+        let shape_energy = squared_energy(
+            &v[TAG_NAME_DIMS + TAG_PATTERN_DIMS + JSON_KEY_DIMS + ENCODING_DIMS + CONTENT_DIMS..],
+        );
+
+        assert!(tag_energy > 0.0 && shape_energy > 0.0);
+        let ratio = tag_energy / shape_energy;
+        assert!(
+            (0.66..1.5).contains(&ratio),
+            "families should carry comparable energy, ratio {}",
+            ratio
+        );
+    }
+
+    #[test]
+    fn test_blend_vectors_leans_toward_kept_history() {
+        let old = vec![1.0, 0.0];
+        let fresh = vec![0.0, 1.0];
+        let blended = blend_vectors(&old, &fresh, 0.8);
+
+        let magnitude: f32 = blended.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (magnitude - 1.0).abs() < 1e-5,
+            "blend must stay unit length"
+        );
+        assert!(
+            cosine(&blended, &old) > cosine(&blended, &fresh),
+            "keep=0.8 should lean toward the old vector"
+        );
+    }
 
     // Helper to create test events - use EventBuilder which is simpler
     fn create_test_event(kind: u16, tag_strings: Vec<&str>, content: &str) -> Event {

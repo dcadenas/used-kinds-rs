@@ -77,6 +77,10 @@ fn is_old(unix_time: i64) -> bool {
     unix_time < (Utc::now() - chrono::Duration::days(30)).timestamp_millis()
 }
 
+/// Cosine score two kinds must reach to be clustered together. Recalibrate
+/// against the logged best-neighbor histogram whenever the featurizer changes.
+const CLUSTER_SIMILARITY_THRESHOLD: f32 = 0.8;
+
 /// Whether a stored point was vectorized with an older featurizer version.
 fn payload_needs_revectorization(payload: &HashMap<String, qdrant_client::qdrant::Value>) -> bool {
     payload.get("feature_version").and_then(|v| v.as_integer())
@@ -375,9 +379,33 @@ impl Actor for JsonActor {
                         1
                     };
 
-                    // Generate vector from event features
+                    // Generate vector from event features, blended with the
+                    // stored vector so one unusual event cannot teleport the
+                    // kind across the feature space.
                     let features = crate::similarity::EventFeatures::from_event(&event_clone);
-                    let vector = features.to_vector();
+                    let fresh_vector = features.to_vector();
+
+                    let stored_vector = current_point
+                        .as_ref()
+                        .filter(|p| !payload_needs_revectorization(&p.payload))
+                        .and_then(|p| p.vectors.as_ref())
+                        .and_then(|v| {
+                            if let Some(
+                                qdrant_client::qdrant::vectors_output::VectorsOptions::Vector(vec),
+                            ) = &v.vectors_options
+                            {
+                                Some(vec.data.clone())
+                            } else {
+                                None
+                            }
+                        });
+
+                    let vector = match stored_vector {
+                        Some(old) if old.len() == fresh_vector.len() => {
+                            crate::similarity::blend_vectors(&old, &fresh_vector, 0.8)
+                        }
+                        _ => fresh_vector,
+                    };
 
                     // Create base payload
                     let mut payload_json = serde_json::json!({
@@ -418,7 +446,7 @@ impl Actor for JsonActor {
                     if is_new_event {
                         let search_request =
                             SearchPointsBuilder::new(&collection, vector.clone(), 10)
-                                .score_threshold(0.8)
+                                .score_threshold(CLUSTER_SIMILARITY_THRESHOLD)
                                 .with_payload(true)
                                 .build();
 
@@ -636,6 +664,7 @@ impl Actor for JsonActor {
 
                     let mut clusters: HashMap<u16, (u16, f64)> = HashMap::new();
                     let mut assigned_to_cluster: HashSet<u16> = HashSet::new();
+                    let mut best_scores: Vec<f32> = Vec::new();
 
                     // For each point, search for similar neighbors using Qdrant
                     for point in &all_points {
@@ -670,9 +699,9 @@ impl Actor for JsonActor {
                             continue;
                         };
 
-                        // Search for similar points (score > 0.8)
+                        // Search without a server-side threshold so the full
+                        // score distribution is observable; threshold below.
                         let search_request = SearchPointsBuilder::new(&collection, vector, 10)
-                            .score_threshold(0.8)
                             .with_payload(false)
                             .build();
 
@@ -703,6 +732,15 @@ impl Actor for JsonActor {
                                     })
                                     .unwrap_or(false)
                             })
+                            .collect();
+
+                        if let Some(top) = neighbors.first() {
+                            best_scores.push(top.score);
+                        }
+
+                        let neighbors: Vec<_> = neighbors
+                            .into_iter()
+                            .filter(|sp| sp.score >= CLUSTER_SIMILARITY_THRESHOLD)
                             .collect();
 
                         // If we found at least 1 neighbor (excluding self), create a cluster
@@ -744,7 +782,7 @@ impl Actor for JsonActor {
                                             }).unwrap_or(false)
                                         })
                                         .map(|sp| sp.score as f64)
-                                        .unwrap_or(0.8)
+                                        .unwrap_or(CLUSTER_SIMILARITY_THRESHOLD as f64)
                                 };
 
                                 clusters.insert(member_kind, (cluster_id, similarity));
@@ -758,6 +796,25 @@ impl Actor for JsonActor {
                             );
                         }
                     }
+
+                    // Best-neighbor score distribution; use this to recalibrate
+                    // CLUSTER_SIMILARITY_THRESHOLD when the featurizer changes.
+                    let mut histogram = [0usize; 6];
+                    for score in &best_scores {
+                        let bucket = match *score {
+                            s if s >= 0.95 => 5,
+                            s if s >= 0.9 => 4,
+                            s if s >= 0.8 => 3,
+                            s if s >= 0.7 => 2,
+                            s if s >= 0.5 => 1,
+                            _ => 0,
+                        };
+                        histogram[bucket] += 1;
+                    }
+                    info!(
+                        "Best-neighbor score histogram (<0.5, 0.5-0.7, 0.7-0.8, 0.8-0.9, 0.9-0.95, >=0.95): {:?}",
+                        histogram
+                    );
 
                     // Count cluster sizes to remove single-member clusters
                     let mut cluster_sizes: HashMap<u16, usize> = HashMap::new();

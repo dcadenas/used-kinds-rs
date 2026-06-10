@@ -95,6 +95,7 @@ pub struct JsonStructure {
     pub is_valid_json: bool,
     pub is_object: bool,
     pub is_array: bool,
+    pub top_level_keys: Vec<String>,
     pub top_level_key_count: usize,
     pub nested_key_count: usize, // Keys 2 levels deep
     pub max_nesting_depth: usize,
@@ -128,6 +129,7 @@ pub fn analyze_json_structure(content: &str) -> JsonStructure {
     match &parsed {
         Value::Object(obj) => {
             structure.is_object = true;
+            structure.top_level_keys = obj.keys().cloned().collect();
             structure.top_level_key_count = obj.len();
 
             // Count nested keys (2 levels deep)
