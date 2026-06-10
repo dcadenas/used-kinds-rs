@@ -89,6 +89,18 @@ fn is_old(unix_time: i64) -> bool {
 /// showed the same valley.
 const CLUSTER_SIMILARITY_THRESHOLD: f32 = 0.9;
 
+/// Cluster id for a new point joining via the incremental path: the
+/// neighbor's cluster if it already has one, otherwise derived from the two
+/// founding members. Batch clustering uses the lowest member kind as the
+/// cluster id, and the periodic recompute assumes the same contract.
+fn incremental_cluster_id(
+    neighbor_cluster_id: Option<i64>,
+    neighbor_kind: Option<i64>,
+    new_kind: u16,
+) -> Option<i64> {
+    neighbor_cluster_id.or_else(|| neighbor_kind.map(|nk| nk.min(i64::from(new_kind))))
+}
+
 /// Whether a stored point was vectorized with an older featurizer version.
 fn payload_needs_revectorization(payload: &HashMap<String, qdrant_client::qdrant::Value>) -> bool {
     payload.get("feature_version").and_then(|v| v.as_integer())
@@ -341,6 +353,15 @@ impl Actor for JsonActor {
         myself.send_interval(Duration::from_secs(60 * 60 * 6), || {
             JsonActorMessage::CleanupDocumentedKinds
         });
+        // Periodic recompute re-derives assignments from current vectors as
+        // EMA updates drift them, overwriting or clearing stale incremental
+        // assignments. Keep the period an hour or more: the
+        // clustering_in_progress debounce clears when ApplyClusters is
+        // handled, before the spawned apply task finishes writing payloads,
+        // so a short period could overlap an in-flight apply.
+        myself.send_interval(Duration::from_secs(60 * 60 * 3), || {
+            JsonActorMessage::ComputeClusters
+        });
         let myself_clone = myself.clone();
         let (http_actor, _) = Actor::spawn_linked(
             Some("HttpActor".to_string()),
@@ -581,11 +602,14 @@ impl Actor for JsonActor {
                                 // Prefer the neighbor's existing cluster over its kind
                                 // number so incremental assignment matches the batch
                                 // clustering scheme (cluster id = lowest member kind).
-                                let cluster_id = first_neighbor
-                                    .payload
-                                    .get("cluster_id")
-                                    .and_then(|v| v.as_integer())
-                                    .or(neighbor_kind);
+                                let cluster_id = incremental_cluster_id(
+                                    first_neighbor
+                                        .payload
+                                        .get("cluster_id")
+                                        .and_then(|v| v.as_integer()),
+                                    neighbor_kind,
+                                    kind_u16,
+                                );
 
                                 if let Some(cluster_id) = cluster_id {
                                     let similarity = first_neighbor.score as f64;
@@ -1022,6 +1046,26 @@ impl Actor for JsonActor {
 mod tests {
     use super::*;
     use qdrant_client::qdrant::Value;
+
+    #[test]
+    fn test_incremental_cluster_id_prefers_neighbor_cluster() {
+        assert_eq!(incremental_cluster_id(Some(7), Some(100), 200), Some(7));
+    }
+
+    #[test]
+    fn test_incremental_cluster_id_uses_lowest_member_kind_as_fallback() {
+        assert_eq!(
+            incremental_cluster_id(None, Some(100), 200),
+            Some(100),
+            "neighbor kind lower than new kind"
+        );
+        assert_eq!(
+            incremental_cluster_id(None, Some(300), 200),
+            Some(200),
+            "new kind lower than neighbor kind must become the cluster id"
+        );
+        assert_eq!(incremental_cluster_id(None, None, 200), None);
+    }
 
     #[test]
     fn test_payload_without_feature_version_needs_revectorization() {
