@@ -9,7 +9,11 @@ use std::collections::{HashMap, HashSet};
 /// startup. Mixing vectors from different schemes makes similarity garbage.
 ///
 /// v3: `max_nesting_depth` is computed for real (it was constantly 0 in v2).
-pub const FEATURE_VERSION: i64 = 3;
+/// v4: JSON structure features come from raw content (placeholder
+/// substitution mangled compact JSON, zeroing the key/shape families for
+/// any content holding a URL or bare number), and URL placeholders stop
+/// at quotes.
+pub const FEATURE_VERSION: i64 = 4;
 
 // 64-dim vector layout. Each family is normalized to unit energy before the
 // global normalization so no family can drown the others.
@@ -74,6 +78,10 @@ pub struct EventFeatures {
     pub tag_patterns: HashSet<String>,
     /// Normalized content string
     pub normalized_content: String,
+    /// Untouched event content. JSON structure analysis must run on this:
+    /// placeholder substitution can mangle compact JSON, and a real
+    /// timestamp should count as a number, not a placeholder string.
+    pub raw_content: String,
 }
 
 impl EventFeatures {
@@ -86,6 +94,7 @@ impl EventFeatures {
         Self {
             tag_patterns,
             normalized_content,
+            raw_content: event.content.clone(),
         }
     }
 
@@ -120,8 +129,9 @@ impl EventFeatures {
 
         // JSON top-level key names: the strongest "same codebase wrote this"
         // signal available without semantics. Shape stats alone cannot tell
-        // {"cost","cpu"} from {"name","about"}.
-        let json_struct = analyze_json_structure(&self.normalized_content);
+        // {"cost","cpu"} from {"name","about"}. Analyzed on raw content —
+        // placeholder substitution breaks compact JSON parsing.
+        let json_struct = analyze_json_structure(&self.raw_content);
 
         let mut json_keys = [0.0f32; JSON_KEY_DIMS];
         for key in &json_struct.top_level_keys {
@@ -371,6 +381,7 @@ mod tests {
         EventFeatures {
             tag_patterns: tag_patterns.iter().map(|s| s.to_string()).collect(),
             normalized_content: content.to_string(),
+            raw_content: content.to_string(),
         }
     }
 
@@ -511,6 +522,35 @@ mod tests {
         // Create a simple runtime for the test
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async { keys.sign_event(unsigned).await.unwrap() })
+    }
+
+    #[test]
+    fn test_json_features_survive_url_and_bare_timestamp_in_compact_json() {
+        // Compact JSON with a URL value and a bare unix timestamp. The
+        // placeholder normalization mangles this (URL eats to end-of-string,
+        // <TIMESTAMP> is an unquoted token), so JSON structure analysis must
+        // not run on the normalized text or these families collapse to zero.
+        let event = create_test_event(
+            5300,
+            vec![],
+            r#"{"image_url":"https://cdn.example.com/img.png","created_at":1699123456,"name":"thing"}"#,
+        );
+        let f = EventFeatures::from_event(&event);
+        let v = f.to_vector();
+
+        let keys_start = TAG_NAME_DIMS + TAG_PATTERN_DIMS;
+        let json_keys = &v[keys_start..keys_start + JSON_KEY_DIMS];
+        let shape_start = keys_start + JSON_KEY_DIMS + ENCODING_DIMS + CONTENT_DIMS;
+        let json_shape = &v[shape_start..];
+
+        assert!(
+            squared_energy(json_keys) > 0.0,
+            "json key family must see the real top-level keys"
+        );
+        assert!(
+            squared_energy(json_shape) > 0.0,
+            "json shape family must see valid JSON"
+        );
     }
 
     #[test]

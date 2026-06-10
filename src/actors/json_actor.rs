@@ -81,10 +81,12 @@ fn is_old(unix_time: i64) -> bool {
 /// Cosine score two kinds must reach to be clustered together. Recalibrate
 /// against the logged best-neighbor histogram whenever the featurizer changes.
 ///
-/// 0.9 sits in the valley of the featurizer-v2 distribution: of 234 seeds,
-/// only 2 scored in [0.9, 0.95) while 109 scored >= 0.95, so it separates
-/// same-codebase near-duplicates from coincidental similarity (at 0.8 about
-/// 92% of all kinds ended up clustered, which made the badge meaningless).
+/// 0.9 sits in the valley of the featurizer-v4 distribution over the real
+/// 658-kind dataset: of 227 seeds, only 4 scored in [0.9, 0.95) while 111
+/// scored >= 0.95 and 112 below 0.9, so it separates same-codebase
+/// near-duplicates from coincidental similarity (at 0.8 about 92% of all
+/// kinds ended up clustered, which made the badge meaningless). v2 and v3
+/// showed the same valley.
 const CLUSTER_SIMILARITY_THRESHOLD: f32 = 0.9;
 
 /// Whether a stored point was vectorized with an older featurizer version.

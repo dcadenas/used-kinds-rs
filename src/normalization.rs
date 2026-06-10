@@ -13,8 +13,9 @@ lazy_static! {
     // Match Unix timestamps (10 digits) and millisecond timestamps (13 digits)
     static ref TIMESTAMP_RE: Regex = Regex::new(r"\b\d{10,13}\b").unwrap();
 
-    // Match URLs
-    static ref URL_RE: Regex = Regex::new(r"https?://[^\s]+").unwrap();
+    // Match URLs. Stops at quotes as well as whitespace so a URL value
+    // inside compact JSON does not swallow the rest of the document.
+    static ref URL_RE: Regex = Regex::new(r#"https?://[^\s"]+"#).unwrap();
 }
 
 /// Normalize event content by replacing identifiable values with placeholders
@@ -280,6 +281,15 @@ mod tests {
         let content = "Visit https://example.com/path and http://test.org";
         let normalized = normalize_content(content);
         assert_eq!(normalized, "Visit <URL> and <URL>");
+    }
+
+    #[test]
+    fn test_normalize_content_url_in_compact_json_stops_at_quote() {
+        // Compact JSON has no whitespace, so a URL placeholder that only
+        // stops at whitespace would swallow the rest of the document.
+        let content = r#"{"image_url":"https://cdn.example.com/img.png","name":"x"}"#;
+        let normalized = normalize_content(content);
+        assert_eq!(normalized, r#"{"image_url":"<URL>","name":"x"}"#);
     }
 
     #[test]
