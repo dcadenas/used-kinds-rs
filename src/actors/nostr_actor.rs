@@ -247,6 +247,33 @@ async fn get_rotating_relays(exclude: &[String]) -> Vec<String> {
     }
 }
 
+/// Swap the rotating relay set: drop old rotating relays and connect new ones.
+///
+/// Old relays are removed from the pool, not just disconnected: a pool-wide
+/// `connect()` reconnects every relay in Terminated status, so disconnected
+/// relays would be resurrected by the next health check and the pool would
+/// grow without bound. No relay carries the GOSSIP flag, so removal is never
+/// blocked. New relays are connected individually for the same reason.
+async fn swap_rotating_relays(client: &Client, old: &[String], new: &[String]) {
+    for relay_url in old {
+        info!("Removing rotating relay from pool: {}", relay_url);
+        if let Err(e) = client.remove_relay(relay_url).await {
+            warn!("Failed to remove relay {}: {}", relay_url, e);
+        }
+    }
+
+    for relay_url in new {
+        info!("Connecting to new rotating relay: {}", relay_url);
+        if let Err(e) = client.add_relay(relay_url).await {
+            warn!("Failed to add relay {}: {}", relay_url, e);
+            continue;
+        }
+        if let Err(e) = client.connect_relay(relay_url).await {
+            warn!("Failed to connect to relay {}: {}", relay_url, e);
+        }
+    }
+}
+
 /// Get initial relay set (always-on + rotating)
 async fn get_initial_relays() -> (Vec<String>, Vec<String>) {
     let always_on: Vec<String> = ALWAYS_ON_RELAYS.iter().map(|s| s.to_string()).collect();
@@ -366,6 +393,10 @@ impl Actor for NostrActor {
                             error!("Failed to add relay {}: {}", relay, e);
                         }
                     }
+                    // Pool-wide connect is safe here only because rotation
+                    // removes old relays from the pool (swap_rotating_relays):
+                    // the pool holds always-on plus current rotating relays,
+                    // exactly the set worth reconnecting during a stall.
                     state.client.connect().await;
 
                     state.reset_notification_handler(myself);
@@ -399,32 +430,18 @@ impl Actor for NostrActor {
                     return Ok(());
                 }
 
-                // Disconnect from old rotating relays
-                for relay_url in &state.current_rotating_relays {
-                    if let Ok(url) = Url::parse(relay_url) {
-                        info!("Disconnecting from rotating relay: {}", relay_url);
-                        if let Err(e) = state.client.disconnect_relay(url).await {
-                            warn!("Failed to disconnect from {}: {}", relay_url, e);
-                        }
-                    }
-                }
+                swap_rotating_relays(
+                    &state.client,
+                    &state.current_rotating_relays,
+                    &new_rotating_relays,
+                )
+                .await;
 
-                // Connect to new rotating relays
-                for relay_url in &new_rotating_relays {
-                    info!("Connecting to new rotating relay: {}", relay_url);
-                    if let Err(e) = state.client.add_relay(relay_url).await {
-                        warn!("Failed to add relay {}: {}", relay_url, e);
-                    }
-                }
-
-                state.client.connect().await;
-
-                // Update state
-                state.current_rotating_relays = new_rotating_relays.clone();
+                state.current_rotating_relays = new_rotating_relays;
 
                 info!(
                     "Relay rotation complete. New rotating relays: {:?}",
-                    new_rotating_relays
+                    state.current_rotating_relays
                 );
             }
         }
@@ -465,5 +482,36 @@ mod tests {
     #[test]
     fn test_parse_online_relays_rejects_empty_list() {
         assert_eq!(parse_online_relays(200, "[]"), None);
+    }
+
+    #[tokio::test]
+    async fn test_swap_rotating_relays_removes_old_relays_from_pool() {
+        let client = Client::default();
+        client.add_relay("ws://127.0.0.1:9101").await.unwrap(); // stands in for an always-on relay
+        client.add_relay("ws://127.0.0.1:9102").await.unwrap(); // old rotating relay
+
+        let old = vec!["ws://127.0.0.1:9102".to_string()];
+        let new = vec!["ws://127.0.0.1:9103".to_string()];
+        swap_rotating_relays(&client, &old, &new).await;
+
+        let pool: Vec<String> = client
+            .relays()
+            .await
+            .keys()
+            .map(|u| u.to_string())
+            .collect();
+        assert!(
+            pool.iter().any(|u| u.starts_with("ws://127.0.0.1:9101")),
+            "always-on relay must stay in the pool: {pool:?}"
+        );
+        assert!(
+            !pool.iter().any(|u| u.starts_with("ws://127.0.0.1:9102")),
+            "old rotating relay must leave the pool (disconnect alone lets pool-wide \
+             connect() resurrect it): {pool:?}"
+        );
+        assert!(
+            pool.iter().any(|u| u.starts_with("ws://127.0.0.1:9103")),
+            "new rotating relay must join the pool: {pool:?}"
+        );
     }
 }
