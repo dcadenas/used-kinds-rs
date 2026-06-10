@@ -35,6 +35,9 @@ pub enum JsonActorMessage {
     /// The clustering run ended — payloads written or the run aborted.
     /// Releases the schedule and replays a coalesced request.
     ClusteringFinished,
+    /// A background stats refresh finished; `None` means the scroll failed
+    /// and the previous snapshot stays in service.
+    StatsSnapshotRefreshed(Option<Vec<(Kind, KindEntry)>>),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -55,6 +58,7 @@ pub struct State {
     nostr_actor: ActorRef<NostrActorMessage>,
     recommended_apps: HashMap<Kind, Timestamp>,
     clustering: ClusteringSchedule,
+    stats: StatsSnapshot,
     qdrant_client: qdrant_client::Qdrant, // Now required, not optional
 }
 
@@ -74,6 +78,69 @@ impl State {
         }
 
         Ok(())
+    }
+}
+
+/// How long a stats snapshot stays fresh. HTTP reads are served from the
+/// snapshot, so this bounds both staleness and the Qdrant scroll rate:
+/// at most one full scroll per TTL instead of one per request.
+const STATS_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
+
+/// Cached stats served to HTTP readers (stale-while-revalidate).
+///
+/// GetStatsVec used to scroll every Qdrant point per request inside the
+/// actor's handle loop, serializing O(N) RPCs ahead of event processing.
+/// Readers now get the snapshot immediately; when it is older than the
+/// TTL one refresh runs in a spawned task and lands via
+/// StatsSnapshotRefreshed.
+struct StatsSnapshot {
+    data: Vec<(Kind, KindEntry)>,
+    refreshed_at: Option<std::time::Instant>,
+    refresh_running: bool,
+}
+
+impl StatsSnapshot {
+    fn fresh(data: Vec<(Kind, KindEntry)>, now: std::time::Instant) -> Self {
+        Self {
+            data,
+            refreshed_at: Some(now),
+            refresh_running: false,
+        }
+    }
+
+    /// Never primed: stale from the start so the first read refreshes.
+    fn empty() -> Self {
+        Self {
+            data: Vec::new(),
+            refreshed_at: None,
+            refresh_running: false,
+        }
+    }
+
+    /// True when the caller must start a background refresh now.
+    fn begin_refresh_if_stale(&mut self, ttl: Duration, now: std::time::Instant) -> bool {
+        if self.refresh_running {
+            return false;
+        }
+        let is_fresh = self
+            .refreshed_at
+            .map(|at| now.duration_since(at) < ttl)
+            .unwrap_or(false);
+        if is_fresh {
+            return false;
+        }
+        self.refresh_running = true;
+        true
+    }
+
+    /// Store a finished refresh. `None` (failed scroll) keeps the old data
+    /// and leaves the snapshot stale so the next read retries.
+    fn apply_refresh(&mut self, result: Option<Vec<(Kind, KindEntry)>>, now: std::time::Instant) {
+        self.refresh_running = false;
+        if let Some(data) = result {
+            self.data = data;
+            self.refreshed_at = Some(now);
+        }
     }
 }
 
@@ -511,11 +578,25 @@ impl Actor for JsonActor {
             Err(e) => error!("Sentinel cleanup failed (continuing anyway): {}", e),
         }
 
+        // Prime the stats snapshot so the first HTTP read is served from
+        // memory instead of scrolling Qdrant in the handle loop.
+        let stats = match query_all_from_qdrant(&qdrant_client).await {
+            Ok(data) => {
+                info!("Primed stats snapshot with {} kinds", data.len());
+                StatsSnapshot::fresh(data, std::time::Instant::now())
+            }
+            Err(e) => {
+                error!("Failed to prime stats snapshot (starting empty): {}", e);
+                StatsSnapshot::empty()
+            }
+        };
+
         let state = State {
             http_actor,
             nostr_actor,
             recommended_apps,
             clustering: ClusteringSchedule::default(),
+            stats,
             qdrant_client,
         };
 
@@ -798,24 +879,42 @@ impl Actor for JsonActor {
                 }
             }
             JsonActorMessage::GetStatsVec(_arg, reply) => {
+                // Serve the snapshot immediately; never scroll Qdrant here.
                 if !reply.is_closed() {
-                    // Query Qdrant (required)
-                    let data_as_sorted_vec = match query_all_from_qdrant(&state.qdrant_client).await
-                    {
-                        Ok(vec) => {
-                            info!("Sending {} events from Qdrant", vec.len());
-                            vec
-                        }
-                        Err(e) => {
-                            error!("Failed to query Qdrant: {}", e);
-                            Vec::new() // Return empty on error
-                        }
-                    };
-
-                    if let Err(e) = reply.send(data_as_sorted_vec) {
+                    info!(
+                        "Serving {} kinds from the stats snapshot",
+                        state.stats.data.len()
+                    );
+                    if let Err(e) = reply.send(state.stats.data.clone()) {
                         error!("Error when sending sorted vec: {}", e);
                     }
                 }
+
+                if state
+                    .stats
+                    .begin_refresh_if_stale(STATS_SNAPSHOT_TTL, std::time::Instant::now())
+                {
+                    let client_clone = state.qdrant_client.clone();
+                    let myself_clone = _myself.clone();
+                    tokio::spawn(async move {
+                        let result = match query_all_from_qdrant(&client_clone).await {
+                            Ok(data) => Some(data),
+                            Err(e) => {
+                                error!("Stats snapshot refresh failed: {}", e);
+                                None
+                            }
+                        };
+                        if let Err(e) = cast!(
+                            myself_clone,
+                            JsonActorMessage::StatsSnapshotRefreshed(result)
+                        ) {
+                            error!("Failed to deliver stats snapshot: {}", e);
+                        }
+                    });
+                }
+            }
+            JsonActorMessage::StatsSnapshotRefreshed(result) => {
+                state.stats.apply_refresh(result, std::time::Instant::now());
             }
             JsonActorMessage::CleanupDocumentedKinds => {
                 // Query Qdrant to find kinds to remove
@@ -1185,6 +1284,85 @@ mod tests {
             matches!(failed, StoredPoint::Unavailable(_)),
             "a fetch error must not be treated as a confirmed-new point: \
              the count=1 path would overwrite the stored count and EMA vector"
+        );
+    }
+
+    fn test_entry(kind: u16) -> (Kind, KindEntry) {
+        let keys = Keys::generate();
+        let unsigned = EventBuilder::new(Kind::from(kind), "{}").build(keys.public_key());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let event = rt.block_on(async { keys.sign_event(unsigned).await.unwrap() });
+        (
+            Kind::from(kind),
+            KindEntry {
+                event,
+                count: 1,
+                last_updated: 1,
+                recommended_app: None,
+                recommended_app_event: None,
+                cluster_id: None,
+                cluster_similarity: None,
+            },
+        )
+    }
+
+    #[test]
+    fn test_stats_snapshot_serves_fresh_and_refreshes_when_stale() {
+        let now = std::time::Instant::now();
+        let mut snapshot = StatsSnapshot::fresh(vec![], now);
+
+        assert!(
+            !snapshot.begin_refresh_if_stale(STATS_SNAPSHOT_TTL, now),
+            "a fresh snapshot must not trigger a refresh"
+        );
+
+        let later = now + STATS_SNAPSHOT_TTL;
+        assert!(
+            snapshot.begin_refresh_if_stale(STATS_SNAPSHOT_TTL, later),
+            "a stale snapshot starts exactly one refresh"
+        );
+        assert!(
+            !snapshot.begin_refresh_if_stale(STATS_SNAPSHOT_TTL, later),
+            "no second refresh while one is running"
+        );
+    }
+
+    #[test]
+    fn test_stats_snapshot_failed_refresh_keeps_data_and_retries() {
+        let now = std::time::Instant::now();
+        let mut snapshot = StatsSnapshot::fresh(vec![test_entry(64999)], now);
+        let later = now + STATS_SNAPSHOT_TTL;
+
+        assert!(snapshot.begin_refresh_if_stale(STATS_SNAPSHOT_TTL, later));
+        snapshot.apply_refresh(None, later);
+        assert_eq!(
+            snapshot.data.len(),
+            1,
+            "a failed refresh must keep serving the old data"
+        );
+        assert!(
+            snapshot.begin_refresh_if_stale(STATS_SNAPSHOT_TTL, later),
+            "a failed refresh leaves the snapshot stale so the next read retries"
+        );
+
+        snapshot.apply_refresh(Some(vec![]), later);
+        assert_eq!(
+            snapshot.data.len(),
+            0,
+            "a successful refresh replaces the data"
+        );
+        assert!(
+            !snapshot.begin_refresh_if_stale(STATS_SNAPSHOT_TTL, later),
+            "a successful refresh makes the snapshot fresh again"
+        );
+    }
+
+    #[test]
+    fn test_stats_snapshot_empty_is_stale_from_the_start() {
+        let mut snapshot = StatsSnapshot::empty();
+        assert!(
+            snapshot.begin_refresh_if_stale(STATS_SNAPSHOT_TTL, std::time::Instant::now()),
+            "a never-primed snapshot refreshes on the first read"
         );
     }
 
