@@ -6,7 +6,6 @@ use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use nostr_sdk::prelude::*;
 use ractor::{cast, concurrency::Duration, Actor, ActorProcessingErr, ActorRef, SupervisionEvent};
-use serde_json;
 use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -18,12 +17,26 @@ const ALWAYS_ON_RELAYS: [&str; 3] = [
     "wss://nos.lol",
 ];
 
-const POPULAR_RELAYS_FALLBACK: [&str; 4] = [
+/// Curated fallback when NIP-66 discovery yields nothing. The first three
+/// are the always-on set, so the rotating pool drawn from here is the tail.
+const POPULAR_RELAYS_FALLBACK: [&str; 8] = [
     "wss://relay.damus.io",
     "wss://relay.primal.net",
     "wss://nos.lol",
     "wss://relay.snort.social",
+    "wss://relay.nostr.band",
+    "wss://nostr.mom",
+    "wss://offchain.pub",
+    "wss://relay.mostr.pub",
 ];
+
+/// Relays that NIP-66 monitors publish kind 30166 relay-discovery events to.
+const MONITOR_RELAYS: [&str; 2] = ["wss://relay.nostr.watch", "wss://monitorlizard.nostr1.com"];
+
+/// Hard ceiling for one relay-discovery attempt. Discovery runs inside
+/// pre_start and the actor's message loop, so it must never hang: on
+/// timeout the caller falls back to POPULAR_RELAYS_FALLBACK.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct NostrActor;
 
@@ -186,38 +199,103 @@ pub enum NostrActorMessage {
     RotateRelays,
 }
 
-/// Parse the nostr.watch online-relays response.
+/// Extract clearnet relay URLs from NIP-66 relay-discovery events.
 ///
-/// Returns `None` for non-2xx statuses, unparseable bodies, or an empty
-/// list so the caller falls back to known relays. nostr.watch outages
-/// surface as HTTP 502 with an empty body, which reqwest reports as `Ok`.
-fn parse_online_relays(status_code: u16, body: &str) -> Option<Vec<String>> {
-    if !(200..300).contains(&status_code) {
-        return None;
+/// Takes the `d` tag (the relay's normalized URL), keeps only `wss://`
+/// clearnet hosts, trims trailing slashes so the result compares equal to
+/// the curated lists, and dedupes across monitors preserving order.
+fn relay_urls_from_discovery_events<'a, I>(events: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a Event>,
+{
+    let mut seen = std::collections::HashSet::new();
+    let mut urls = Vec::new();
+
+    for event in events {
+        let Some(d_value) = event.tags.identifier() else {
+            continue;
+        };
+        let Some(rest) = d_value.strip_prefix("wss://") else {
+            // ws:// (plaintext), http gateways, or a bare monitor pubkey
+            continue;
+        };
+        let host = rest
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("");
+        if host.is_empty()
+            || [".onion", ".i2p", ".loki"]
+                .iter()
+                .any(|overlay| host.ends_with(overlay))
+        {
+            continue;
+        }
+
+        let url = d_value.trim_end_matches('/').to_string();
+        if seen.insert(url.clone()) {
+            urls.push(url);
+        }
     }
 
-    let relays: Vec<String> = serde_json::from_str(body).ok()?;
+    urls
+}
 
-    if relays.is_empty() {
-        return None;
+/// Fetch currently-online relay candidates via NIP-66 (kind 30166) events.
+///
+/// Returns `None` when no monitor answers in time or nothing usable arrives,
+/// so the caller falls back to the curated list. The inner fetch timeout is
+/// shorter than the outer ceiling so partial results win over a hard cut.
+async fn fetch_online_relays() -> Option<Vec<String>> {
+    let fetch = async {
+        let client = Client::default();
+        for monitor in MONITOR_RELAYS {
+            if let Err(e) = client.add_relay(monitor).await {
+                warn!("Failed to add monitor relay {}: {}", monitor, e);
+            }
+        }
+        client.connect().await;
+
+        let since = Timestamp::now() - Duration::from_secs(2 * 60 * 60);
+        let filter = Filter::new()
+            .kind(Kind::from_u16(30166))
+            .since(since)
+            .limit(200);
+        let events = client
+            .fetch_events(filter, DISCOVERY_TIMEOUT - Duration::from_secs(2))
+            .await;
+        client.shutdown().await;
+
+        match events {
+            Ok(events) => {
+                let urls = relay_urls_from_discovery_events(events.iter());
+                if urls.is_empty() {
+                    None
+                } else {
+                    Some(urls)
+                }
+            }
+            Err(e) => {
+                error!("Failed to fetch NIP-66 relay discovery events: {}", e);
+                None
+            }
+        }
+    };
+
+    match tokio::time::timeout(DISCOVERY_TIMEOUT, fetch).await {
+        Ok(result) => result,
+        Err(_) => {
+            warn!("NIP-66 relay discovery timed out");
+            None
+        }
     }
-
-    Some(relays)
 }
 
 /// Get rotating relays, excluding always-on relays and previously used relays
 async fn get_rotating_relays(exclude: &[String]) -> Vec<String> {
-    let fetched = match reqwest::get("https://api.nostr.watch/v1/online").await {
-        Ok(response) => {
-            let status_code = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            parse_online_relays(status_code, &body)
-        }
-        Err(e) => {
-            error!("Failed to fetch relays from nostr.watch: {}", e);
-            None
-        }
-    };
+    let fetched = fetch_online_relays().await;
 
     let always_on_set: Vec<String> = ALWAYS_ON_RELAYS.iter().map(|s| s.to_string()).collect();
 
@@ -230,13 +308,13 @@ async fn get_rotating_relays(exclude: &[String]) -> Vec<String> {
                 .collect();
 
             info!(
-                "Fetched {} rotating relays from nostr.watch",
+                "Fetched {} rotating relay candidates via NIP-66 discovery",
                 filtered.len()
             );
             filtered
         }
         None => {
-            warn!("No usable relay list from nostr.watch, using fallback relays");
+            warn!("No usable relay list from NIP-66 discovery, using fallback relays");
             POPULAR_RELAYS_FALLBACK
                 .iter()
                 .filter(|r| !ALWAYS_ON_RELAYS.contains(r) && !exclude.contains(&r.to_string()))
@@ -274,6 +352,21 @@ async fn swap_rotating_relays(client: &Client, old: &[String], new: &[String]) {
     }
 }
 
+/// Add relays to the pool tolerantly, returning how many were accepted.
+///
+/// One malformed or rejected relay URL must not take the whole set down
+/// with it; the caller decides whether zero usable relays is fatal.
+async fn add_relays_warn_and_skip(client: &Client, relays: &[String]) -> usize {
+    let mut usable = 0;
+    for relay in relays {
+        match client.add_relay(relay).await {
+            Ok(_) => usable += 1,
+            Err(e) => warn!("Skipping relay {}: {}", relay, e),
+        }
+    }
+    usable
+}
+
 /// Get initial relay set (always-on + rotating)
 async fn get_initial_relays() -> (Vec<String>, Vec<String>) {
     let always_on: Vec<String> = ALWAYS_ON_RELAYS.iter().map(|s| s.to_string()).collect();
@@ -304,9 +397,14 @@ impl Actor for NostrActor {
     ) -> Result<Self::State, ActorProcessingErr> {
         let client = Client::default();
 
+        // One bad relay URL must not abort startup (warn-and-skip), but a
+        // pool with zero relays is useless, so that still fails the boot.
         let (all_relays, rotating_relays) = get_initial_relays().await;
-        for relay in all_relays {
-            client.add_relay(relay).await?;
+        let usable = add_relays_warn_and_skip(&client, &all_relays).await;
+        if usable == 0 {
+            return Err(ActorProcessingErr::from(
+                "no usable relays at startup".to_string(),
+            ));
         }
 
         client.connect().await;
@@ -454,34 +552,94 @@ impl Actor for NostrActor {
 mod tests {
     use super::*;
 
+    fn discovery_event(d_value: &str) -> Event {
+        let keys = Keys::generate();
+        let unsigned = EventBuilder::new(Kind::from(30166u16), "")
+            .tag(Tag::identifier(d_value))
+            .build(keys.public_key());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async { keys.sign_event(unsigned).await.unwrap() })
+    }
+
     #[test]
-    fn test_parse_online_relays_accepts_success_with_relay_list() {
-        let body = r#"["wss://relay.one.example","wss://relay.two.example"]"#;
+    fn test_relay_urls_from_discovery_events_extracts_wss_d_tags() {
+        let events = [
+            discovery_event("wss://relay.one.example/"),
+            discovery_event("wss://relay.two.example"),
+        ];
         assert_eq!(
-            parse_online_relays(200, body),
-            Some(vec![
+            relay_urls_from_discovery_events(events.iter()),
+            vec![
                 "wss://relay.one.example".to_string(),
                 "wss://relay.two.example".to_string()
-            ])
+            ],
+            "trailing slashes are trimmed so urls compare equal to the curated lists"
         );
     }
 
     #[test]
-    fn test_parse_online_relays_rejects_error_status_even_with_valid_body() {
-        let body = r#"["wss://relay.one.example"]"#;
-        assert_eq!(parse_online_relays(502, body), None);
-        assert_eq!(parse_online_relays(502, ""), None);
+    fn test_relay_urls_from_discovery_events_skips_overlay_and_non_wss() {
+        let events = [
+            discovery_event("wss://abcdef0123456789.onion"),
+            discovery_event("wss://relay.example.i2p/"),
+            discovery_event("wss://some.relay.loki"),
+            discovery_event("ws://plaintext.example"),
+            discovery_event("https://not-a-relay.example"),
+            // NIP-66 allows a hex pubkey instead of a URL
+            discovery_event("aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66"),
+            discovery_event("wss://good.relay.example"),
+        ];
+        assert_eq!(
+            relay_urls_from_discovery_events(events.iter()),
+            vec!["wss://good.relay.example".to_string()]
+        );
     }
 
     #[test]
-    fn test_parse_online_relays_rejects_unparseable_body() {
-        assert_eq!(parse_online_relays(200, "<html>error</html>"), None);
-        assert_eq!(parse_online_relays(200, ""), None);
+    fn test_relay_urls_from_discovery_events_dedupes_across_monitors() {
+        // Two monitors reporting the same relay must yield one entry
+        let events = [
+            discovery_event("wss://relay.one.example/"),
+            discovery_event("wss://relay.one.example"),
+            discovery_event("wss://relay.two.example"),
+        ];
+        assert_eq!(
+            relay_urls_from_discovery_events(events.iter()),
+            vec![
+                "wss://relay.one.example".to_string(),
+                "wss://relay.two.example".to_string()
+            ]
+        );
     }
 
-    #[test]
-    fn test_parse_online_relays_rejects_empty_list() {
-        assert_eq!(parse_online_relays(200, "[]"), None);
+    #[tokio::test]
+    async fn test_add_relays_warn_and_skip_counts_only_usable_relays() {
+        let client = Client::default();
+        let relays = vec![
+            "not a url at all".to_string(),
+            "wss://relay.ok.example".to_string(),
+        ];
+        let usable = add_relays_warn_and_skip(&client, &relays).await;
+        assert_eq!(usable, 1, "the malformed url is skipped, not fatal");
+        assert!(client
+            .relays()
+            .await
+            .keys()
+            .any(|u| u.to_string().starts_with("wss://relay.ok.example")));
+    }
+
+    #[tokio::test]
+    #[ignore] // Hits live NIP-66 monitor relays; run manually:
+              // cargo test test_fetch_online_relays -- --ignored
+    async fn test_fetch_online_relays_returns_live_relay_list() {
+        let fetched = fetch_online_relays().await;
+        let relays = fetched.expect("NIP-66 monitors should yield at least one relay");
+        assert!(!relays.is_empty());
+        assert!(relays.iter().all(|r| r.starts_with("wss://")));
+        println!("NIP-66 discovery returned {} relays", relays.len());
+        for r in relays.iter().take(10) {
+            println!("  {r}");
+        }
     }
 
     #[tokio::test]
