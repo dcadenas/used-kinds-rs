@@ -121,6 +121,7 @@ pub async fn migrate_from_stats_json(client: &Qdrant, stats_file: &str) -> Resul
             "recommended_app": entry.recommended_app,
             "event_id": entry.event.id.to_string(),
             "event": entry.event.as_json(),
+            "feature_version": crate::similarity::FEATURE_VERSION,
         });
 
         let payload =

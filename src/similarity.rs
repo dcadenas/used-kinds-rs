@@ -2,6 +2,13 @@ use crate::normalization::{analyze_json_structure, normalize_content, normalize_
 use nostr_sdk::prelude::*;
 use std::collections::{HashMap, HashSet};
 
+/// Version of the feature extraction scheme in `EventFeatures::to_vector`.
+///
+/// Stored in every Qdrant point payload; bump it whenever the vector layout
+/// or any feature computation changes so stored points get re-vectorized at
+/// startup. Mixing vectors from different schemes makes similarity garbage.
+pub const FEATURE_VERSION: i64 = 1;
+
 /// Feature vector extracted from an event for similarity comparison
 #[derive(Debug, Clone)]
 pub struct EventFeatures {

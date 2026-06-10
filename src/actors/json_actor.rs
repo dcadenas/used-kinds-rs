@@ -77,6 +77,79 @@ fn is_old(unix_time: i64) -> bool {
     unix_time < (Utc::now() - chrono::Duration::days(30)).timestamp_millis()
 }
 
+/// Whether a stored point was vectorized with an older featurizer version.
+fn payload_needs_revectorization(payload: &HashMap<String, qdrant_client::qdrant::Value>) -> bool {
+    payload.get("feature_version").and_then(|v| v.as_integer())
+        != Some(crate::similarity::FEATURE_VERSION)
+}
+
+/// Recompute vectors for points stored with an older featurizer version.
+///
+/// The full event JSON lives in each payload, so this is mechanical. Without
+/// it, vectors produced by different featurizer versions would be compared
+/// against each other and similarity results would be silently wrong.
+async fn revectorize_outdated_points(client: &qdrant_client::Qdrant) -> Result<usize> {
+    use nostr_sdk::JsonUtil;
+    use qdrant_client::qdrant::{PointStruct, UpsertPointsBuilder};
+
+    let collection = crate::qdrant_client::collection_name();
+    let mut updated_points = Vec::new();
+
+    for point in scroll_all_points(client, collection, true, false).await? {
+        if !payload_needs_revectorization(&point.payload) {
+            continue;
+        }
+
+        let Some(kind_num) = point.id.as_ref().and_then(|id| {
+            if let Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)) =
+                id.point_id_options.as_ref()
+            {
+                Some(*n)
+            } else {
+                None
+            }
+        }) else {
+            continue;
+        };
+
+        let Some(event_json) = point.payload.get("event").and_then(|v| v.as_str()) else {
+            error!("Point {} has no event JSON, cannot re-vectorize", kind_num);
+            continue;
+        };
+
+        let event = match Event::from_json(event_json) {
+            Ok(event) => event,
+            Err(e) => {
+                error!("Point {} event JSON unparseable: {}", kind_num, e);
+                continue;
+            }
+        };
+
+        let vector = crate::similarity::EventFeatures::from_event(&event).to_vector();
+
+        let mut payload = point.payload.clone();
+        payload.insert(
+            "feature_version".to_string(),
+            qdrant_client::qdrant::Value::from(crate::similarity::FEATURE_VERSION),
+        );
+
+        updated_points.push(PointStruct::new(
+            kind_num,
+            vector,
+            qdrant_client::Payload::from(payload),
+        ));
+    }
+
+    let updated = updated_points.len();
+    for chunk in updated_points.chunks(100) {
+        client
+            .upsert_points(UpsertPointsBuilder::new(collection, chunk.to_vec()).build())
+            .await?;
+    }
+
+    Ok(updated)
+}
+
 /// Scroll every point in a collection, following pagination.
 ///
 /// The plain `.limit(N)` scroll silently truncates past N points, which is
@@ -186,6 +259,20 @@ impl Actor for JsonActor {
             Ok(true) => info!("Completed one-time migration from stats.json to Qdrant"),
             Ok(false) => info!("No migration needed"),
             Err(e) => error!("Migration failed (continuing anyway): {}", e),
+        }
+
+        // Bring stored vectors up to the current featurizer version
+        match revectorize_outdated_points(&qdrant_client).await {
+            Ok(0) => info!(
+                "All points are at feature version {}",
+                crate::similarity::FEATURE_VERSION
+            ),
+            Ok(n) => info!(
+                "Re-vectorized {} points to feature version {}",
+                n,
+                crate::similarity::FEATURE_VERSION
+            ),
+            Err(e) => error!("Re-vectorization failed (continuing anyway): {}", e),
         }
 
         let state = State {
@@ -300,6 +387,7 @@ impl Actor for JsonActor {
                         "recommended_app": null,  // Will be updated separately
                         "event_id": event_clone.id.to_string(),
                         "event": event_clone.as_json(),
+                        "feature_version": crate::similarity::FEATURE_VERSION,
                     });
 
                     // A plain count update must not wipe fields other flows maintain
@@ -790,5 +878,34 @@ impl Actor for JsonActor {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qdrant_client::qdrant::Value;
+
+    #[test]
+    fn test_payload_without_feature_version_needs_revectorization() {
+        let payload: HashMap<String, Value> = HashMap::new();
+        assert!(payload_needs_revectorization(&payload));
+    }
+
+    #[test]
+    fn test_payload_with_old_feature_version_needs_revectorization() {
+        let mut payload: HashMap<String, Value> = HashMap::new();
+        payload.insert("feature_version".to_string(), Value::from(0i64));
+        assert!(payload_needs_revectorization(&payload));
+    }
+
+    #[test]
+    fn test_payload_with_current_feature_version_is_kept() {
+        let mut payload: HashMap<String, Value> = HashMap::new();
+        payload.insert(
+            "feature_version".to_string(),
+            Value::from(crate::similarity::FEATURE_VERSION),
+        );
+        assert!(!payload_needs_revectorization(&payload));
     }
 }
