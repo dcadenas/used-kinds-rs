@@ -9,12 +9,6 @@ use serde_json::Value;
 /// # Returns
 ///
 /// Returns tuple of (supported_kinds, app_name).
-///
-/// # Note
-///
-/// Currently unused - recommended app functionality not yet fully implemented.
-/// Kept for future NIP-89 integration.
-#[allow(dead_code)]
 pub fn parse_recommended_app(app_event: &Event) -> Result<(Box<[Kind]>, String)> {
     let alt_tag_data = app_event.tags.iter().find_map(|tag| {
         // Look for alt tags using tag name
@@ -60,4 +54,52 @@ pub fn parse_recommended_app(app_event: &Event) -> Result<(Box<[Kind]>, String)>
             .or(content_value)
             .unwrap_or_else(|| "None found".to_string()),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handler_event(tags: Vec<Vec<&str>>, content: &str) -> Event {
+        let mut builder = EventBuilder::new(Kind::from(31990u16), content);
+        for tag in tags {
+            builder = builder.tag(Tag::parse(tag).unwrap());
+        }
+        let keys = Keys::generate();
+        let unsigned = builder.build(keys.public_key());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async { keys.sign_event(unsigned).await.unwrap() })
+    }
+
+    #[test]
+    fn test_parses_kinds_and_alt_tag_name() {
+        let event = handler_event(
+            vec![vec!["alt", "MyApp"], vec!["k", "30023"], vec!["k", "31234"]],
+            "",
+        );
+        let (kinds, app) = parse_recommended_app(&event).unwrap();
+        assert_eq!(app, "MyApp");
+        assert_eq!(
+            kinds.as_ref(),
+            &[Kind::from(30023u16), Kind::from(31234u16)]
+        );
+    }
+
+    #[test]
+    fn test_falls_back_to_content_name_fields() {
+        let event = handler_event(
+            vec![vec!["k", "1063"]],
+            r#"{"name":"ContentApp","about":"x"}"#,
+        );
+        let (kinds, app) = parse_recommended_app(&event).unwrap();
+        assert_eq!(app, "ContentApp");
+        assert_eq!(kinds.as_ref(), &[Kind::from(1063u16)]);
+    }
+
+    #[test]
+    fn test_skips_unparseable_kind_tags() {
+        let event = handler_event(vec![vec!["alt", "App"], vec!["k", "not-a-kind"]], "");
+        let (kinds, _) = parse_recommended_app(&event).unwrap();
+        assert!(kinds.is_empty());
+    }
 }

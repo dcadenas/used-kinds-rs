@@ -521,10 +521,35 @@ impl Actor for JsonActor {
                     error!("Failed to refresh recommended app: {}", e);
                 }
             }
-            JsonActorMessage::RecordRecommendedApp(_event, _url) => {
-                // TODO: Implement payload update in Qdrant for recommended_app
-                // For now, skipping - not critical for core functionality
-                // Will be set on next event update for that kind
+            JsonActorMessage::RecordRecommendedApp(event, _url) => {
+                match get_recommended_app_string::parse_recommended_app(&event) {
+                    Ok((kinds, recommended_app)) => {
+                        if kinds.is_empty() {
+                            debug!("Recommended app event {} lists no kinds", event.id);
+                        } else {
+                            let client_clone = state.qdrant_client.clone();
+                            tokio::spawn(async move {
+                                match crate::qdrant_client::set_recommended_app(
+                                    &client_clone,
+                                    &kinds,
+                                    &recommended_app,
+                                )
+                                .await
+                                {
+                                    Ok(()) => info!(
+                                        "Recorded recommended app '{}' for {} kinds",
+                                        recommended_app,
+                                        kinds.len()
+                                    ),
+                                    Err(e) => {
+                                        error!("Failed to persist recommended app: {}", e)
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    Err(e) => error!("Failed to parse recommended app: {}", e),
+                }
             }
             JsonActorMessage::GetStatsVec(_arg, reply) => {
                 if !reply.is_closed() {

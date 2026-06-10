@@ -155,6 +155,45 @@ pub async fn migrate_from_stats_json(client: &Qdrant, stats_file: &str) -> Resul
     Ok(true)
 }
 
+/// Persist the recommended app name for a set of kinds.
+///
+/// Uses payload merge (`set_payload`) so vectors and other payload keys stay
+/// untouched; ids not present in the collection are skipped by Qdrant.
+pub async fn set_recommended_app(
+    client: &Qdrant,
+    kinds: &[nostr_sdk::prelude::Kind],
+    app_name: &str,
+) -> Result<()> {
+    use qdrant_client::qdrant::{PointId, PointsIdsList, SetPayloadPointsBuilder};
+
+    if kinds.is_empty() {
+        return Ok(());
+    }
+
+    let ids: Vec<PointId> = kinds
+        .iter()
+        .map(|kind| PointId::from(u16::from(*kind) as u64))
+        .collect();
+
+    let payload = qdrant_client::Payload::from(
+        serde_json::json!({ "recommended_app": app_name })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    );
+
+    client
+        .set_payload(
+            SetPayloadPointsBuilder::new(COLLECTION_NAME, payload)
+                .points_selector(PointsIdsList { ids })
+                .build(),
+        )
+        .await
+        .context("Failed to set recommended app payload")?;
+
+    Ok(())
+}
+
 /// Convert Qdrant payload back to KindEntry
 pub fn payload_to_kind_entry(
     payload: &HashMap<String, qdrant_client::qdrant::Value>,
@@ -209,6 +248,75 @@ pub fn payload_to_kind_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore] // Only run when Qdrant is available locally
+    async fn test_set_recommended_app_merges_payload() {
+        use nostr_sdk::prelude::Kind;
+        use qdrant_client::qdrant::{
+            DeletePointsBuilder, GetPointsBuilder, PointId, PointStruct, UpsertPointsBuilder,
+        };
+
+        let client = initialize_qdrant().await.unwrap();
+
+        // Seed a point whose existing payload must survive the merge
+        let payload = qdrant_client::Payload::from(
+            serde_json::json!({"kind": 64999, "count": 7})
+                .as_object()
+                .cloned()
+                .unwrap(),
+        );
+        let mut vector = vec![0.0f32; VECTOR_SIZE as usize];
+        vector[0] = 1.0;
+        client
+            .upsert_points(
+                UpsertPointsBuilder::new(
+                    COLLECTION_NAME,
+                    vec![PointStruct::new(64999u64, vector, payload)],
+                )
+                .build(),
+            )
+            .await
+            .unwrap();
+
+        set_recommended_app(&client, &[Kind::from(64999u16)], "TestApp")
+            .await
+            .unwrap();
+
+        let point_id: PointId = 64999u64.into();
+        let got = client
+            .get_points(
+                GetPointsBuilder::new(COLLECTION_NAME, vec![point_id])
+                    .with_payload(true)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let point = got.result.first().expect("seeded point exists");
+
+        assert_eq!(
+            point
+                .payload
+                .get("recommended_app")
+                .and_then(|v| v.as_str())
+                .map(String::as_str),
+            Some("TestApp")
+        );
+        // Merge must not clobber unrelated keys
+        assert_eq!(
+            point.payload.get("count").and_then(|v| v.as_integer()),
+            Some(7)
+        );
+
+        client
+            .delete_points(
+                DeletePointsBuilder::new(COLLECTION_NAME)
+                    .points(vec![PointId::from(64999u64)])
+                    .build(),
+            )
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     #[ignore] // Only run when Qdrant is available locally
