@@ -194,6 +194,46 @@ async fn revectorize_outdated_points(client: &qdrant_client::Qdrant) -> Result<u
     Ok(updated)
 }
 
+/// Remove the legacy "None found" sentinel from stored payloads.
+///
+/// Earlier releases persisted the literal string "None found" as a real
+/// recommended_app value; it leaked into the stats page and shadowed
+/// later lookups. parse_recommended_app no longer produces it, so this
+/// scrub converges and becomes a no-op.
+async fn cleanup_recommended_app_sentinel(client: &qdrant_client::Qdrant) -> Result<usize> {
+    use qdrant_client::qdrant::{DeletePayloadPointsBuilder, PointsIdsList};
+
+    let collection = crate::qdrant_client::collection_name();
+    let mut ids = Vec::new();
+    for point in scroll_all_points(client, collection, true, false).await? {
+        if point
+            .payload
+            .get("recommended_app")
+            .and_then(|v| v.as_str())
+            .map(String::as_str)
+            == Some("None found")
+        {
+            if let Some(id) = point.id {
+                ids.push(id);
+            }
+        }
+    }
+
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let count = ids.len();
+    client
+        .delete_payload(
+            DeletePayloadPointsBuilder::new(collection, vec!["recommended_app".to_string()])
+                .points_selector(PointsIdsList { ids })
+                .build(),
+        )
+        .await?;
+    Ok(count)
+}
+
 /// Scroll every point in a collection, following pagination.
 ///
 /// The plain `.limit(N)` scroll silently truncates past N points, which is
@@ -426,6 +466,13 @@ impl Actor for JsonActor {
                 crate::similarity::FEATURE_VERSION
             ),
             Err(e) => error!("Re-vectorization failed (continuing anyway): {}", e),
+        }
+
+        // Scrub the legacy "None found" sentinel; reruns harmlessly.
+        match cleanup_recommended_app_sentinel(&qdrant_client).await {
+            Ok(0) => {}
+            Ok(n) => info!("Removed 'None found' sentinel from {} points", n),
+            Err(e) => error!("Sentinel cleanup failed (continuing anyway): {}", e),
         }
 
         let state = State {
@@ -685,33 +732,33 @@ impl Actor for JsonActor {
                 }
             }
             JsonActorMessage::RecordRecommendedApp(event, _url) => {
-                match get_recommended_app_string::parse_recommended_app(&event) {
-                    Ok((kinds, recommended_app)) => {
-                        if kinds.is_empty() {
-                            debug!("Recommended app event {} lists no kinds", event.id);
-                        } else {
-                            let client_clone = state.qdrant_client.clone();
-                            tokio::spawn(async move {
-                                match crate::qdrant_client::set_recommended_app(
-                                    &client_clone,
-                                    &kinds,
-                                    &recommended_app,
-                                )
-                                .await
-                                {
-                                    Ok(()) => info!(
-                                        "Recorded recommended app '{}' for {} kinds",
-                                        recommended_app,
-                                        kinds.len()
-                                    ),
-                                    Err(e) => {
-                                        error!("Failed to persist recommended app: {}", e)
-                                    }
+                let (kinds, recommended_app) =
+                    get_recommended_app_string::parse_recommended_app(&event);
+                match recommended_app {
+                    Some(recommended_app) if !kinds.is_empty() => {
+                        let client_clone = state.qdrant_client.clone();
+                        tokio::spawn(async move {
+                            match crate::qdrant_client::set_recommended_app(
+                                &client_clone,
+                                &kinds,
+                                &recommended_app,
+                            )
+                            .await
+                            {
+                                Ok(()) => info!(
+                                    "Recorded recommended app '{}' for {} kinds",
+                                    recommended_app,
+                                    kinds.len()
+                                ),
+                                Err(e) => {
+                                    error!("Failed to persist recommended app: {}", e)
                                 }
-                            });
-                        }
+                            }
+                        });
                     }
-                    Err(e) => error!("Failed to parse recommended app: {}", e),
+                    Some(_) => debug!("Recommended app event {} lists no kinds", event.id),
+                    // No usable name: persist nothing rather than a sentinel.
+                    None => debug!("Recommended app event {} has no usable name", event.id),
                 }
             }
             JsonActorMessage::GetStatsVec(_arg, reply) => {
@@ -1145,6 +1192,97 @@ mod tests {
             Value::from(crate::similarity::FEATURE_VERSION),
         );
         assert!(!payload_needs_revectorization(&payload));
+    }
+
+    #[tokio::test]
+    #[ignore] // Only run when Qdrant is available locally
+    async fn test_cleanup_recommended_app_sentinel_removes_only_sentinel_values() {
+        use nostr_sdk::JsonUtil;
+        use qdrant_client::qdrant::{
+            DeletePointsBuilder, GetPointsBuilder, PointId, PointStruct, UpsertPointsBuilder,
+        };
+
+        let client = crate::qdrant_client::initialize_qdrant().await.unwrap();
+        let collection = crate::qdrant_client::collection_name();
+
+        let keys = Keys::generate();
+        let unsigned = EventBuilder::new(Kind::from(64901u16), "x").build(keys.public_key());
+        let event = keys.sign_event(unsigned).await.unwrap();
+
+        let seed = |kind: u64, app: &str| {
+            let payload = qdrant_client::Payload::from(
+                serde_json::json!({
+                    "kind": kind,
+                    "count": 2,
+                    "last_updated": 1,
+                    "recommended_app": app,
+                    "event": event.as_json(),
+                    "feature_version": crate::similarity::FEATURE_VERSION,
+                })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            );
+            let mut vector = vec![0.0f32; crate::qdrant_client::vector_size()];
+            vector[0] = 1.0;
+            PointStruct::new(kind, vector, payload)
+        };
+
+        client
+            .upsert_points(
+                UpsertPointsBuilder::new(
+                    collection,
+                    vec![seed(64901, "None found"), seed(64902, "RealApp")],
+                )
+                .build(),
+            )
+            .await
+            .unwrap();
+
+        let removed = cleanup_recommended_app_sentinel(&client).await.unwrap();
+        assert!(removed >= 1, "the sentinel point must be scrubbed");
+
+        let got = client
+            .get_points(
+                GetPointsBuilder::new(
+                    collection,
+                    vec![PointId::from(64901u64), PointId::from(64902u64)],
+                )
+                .with_payload(true)
+                .build(),
+            )
+            .await
+            .unwrap();
+
+        for point in &got.result {
+            let kind = point.payload.get("kind").and_then(|v| v.as_integer());
+            let app = point
+                .payload
+                .get("recommended_app")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            match kind {
+                Some(64901) => {
+                    assert_eq!(app, None, "sentinel value must be deleted");
+                    assert_eq!(
+                        point.payload.get("count").and_then(|v| v.as_integer()),
+                        Some(2),
+                        "other payload keys must survive the scrub"
+                    );
+                }
+                Some(64902) => assert_eq!(app.as_deref(), Some("RealApp")),
+                other => panic!("unexpected point in result: {other:?}"),
+            }
+        }
+
+        client
+            .delete_points(
+                DeletePointsBuilder::new(collection)
+                    .points(vec![PointId::from(64901u64), PointId::from(64902u64)])
+                    .build(),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
