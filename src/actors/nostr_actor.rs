@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 const POPULAR_RELAYS_FALLBACK: [&str; 4] = [
     "wss://relay.damus.io",
     "wss://relay.primal.net",
-    "wss://relay.n057r.club",
+    "wss://nos.lol",
     "wss://relay.snort.social",
 ];
 
@@ -177,29 +177,65 @@ pub enum NostrActorMessage {
     HealthCheck,
 }
 
-async fn get_relays() -> impl Iterator<Item = String> {
-    let relays: Vec<String> = match reqwest::get("https://api.nostr.watch/v1/online").await {
-        Ok(response) => {
-            let text = response.text().await.unwrap_or_default();
-            let mut relays: Vec<String> = serde_json::from_str(&text).unwrap_or_default();
-            relays.truncate(5);
+/// Parse the nostr.watch online-relays response.
+///
+/// Returns `None` for non-2xx statuses, unparseable bodies, or an empty
+/// list so the caller falls back to known relays. nostr.watch outages
+/// surface as HTTP 502 with an empty body, which reqwest reports as `Ok`.
+fn parse_online_relays(status_code: u16, body: &str) -> Option<Vec<String>> {
+    if !(200..300).contains(&status_code) {
+        return None;
+    }
 
+    let relays: Vec<String> = serde_json::from_str(body).ok()?;
+
+    if relays.is_empty() {
+        return None;
+    }
+
+    Some(relays)
+}
+
+async fn get_relays() -> Vec<String> {
+    let fetched = match reqwest::get("https://api.nostr.watch/v1/online").await {
+        Ok(response) => {
+            let status_code = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            parse_online_relays(status_code, &body)
+        }
+        Err(e) => {
+            error!("Failed to fetch relays from Nostr API: {}", e);
+            None
+        }
+    };
+
+    let relays = match fetched {
+        Some(mut relays) => {
+            relays.truncate(5);
             info!("Fetched relays from nostr.watch");
             relays
         }
-        Err(e) => {
-            let relays = POPULAR_RELAYS_FALLBACK
+        None => {
+            warn!("No usable relay list from nostr.watch, using fallback relays");
+            POPULAR_RELAYS_FALLBACK
                 .iter()
                 .map(|s| s.to_string())
-                .collect();
-
-            error!("Failed to fetch relays from Nostr API: {}", e);
-            relays
+                .collect()
         }
     };
 
     info!("Relays: {:?}", relays);
-    relays.into_iter()
+    relays
+}
+
+async fn refresh_relays(client: &Client) {
+    for relay in get_relays().await {
+        if let Err(e) = client.add_relay(relay.as_str()).await {
+            error!("Failed to add relay {}: {}", relay, e);
+        }
+    }
+
+    client.connect().await;
 }
 
 #[ractor::async_trait]
@@ -215,11 +251,7 @@ impl Actor for NostrActor {
     ) -> Result<Self::State, ActorProcessingErr> {
         let client = Client::default();
 
-        for relay in get_relays().await {
-            client.add_relay(relay).await?;
-        }
-
-        client.connect().await;
+        refresh_relays(&client).await;
 
         let (json_actor, _) = Actor::spawn_linked(
             Some("JsonActor".to_string()),
@@ -289,9 +321,10 @@ impl Actor for NostrActor {
             NostrActorMessage::HealthCheck => {
                 if state.latest_event_received_at + ChronoDuration::seconds(60 * 5) < Utc::now() {
                     warn!(
-                        "No events received in the last 5 minutes, resetting notification handler"
+                        "No events received in the last 5 minutes, refreshing relays and resetting notification handler"
                     );
 
+                    refresh_relays(&state.client).await;
                     state.reset_notification_handler(myself);
                 }
             }
@@ -315,5 +348,40 @@ impl Actor for NostrActor {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_online_relays_accepts_success_with_relay_list() {
+        let body = r#"["wss://relay.one.example","wss://relay.two.example"]"#;
+        assert_eq!(
+            parse_online_relays(200, body),
+            Some(vec![
+                "wss://relay.one.example".to_string(),
+                "wss://relay.two.example".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_online_relays_rejects_error_status_even_with_valid_body() {
+        let body = r#"["wss://relay.one.example"]"#;
+        assert_eq!(parse_online_relays(502, body), None);
+        assert_eq!(parse_online_relays(502, ""), None);
+    }
+
+    #[test]
+    fn test_parse_online_relays_rejects_unparseable_body() {
+        assert_eq!(parse_online_relays(200, "<html>error</html>"), None);
+        assert_eq!(parse_online_relays(200, ""), None);
+    }
+
+    #[test]
+    fn test_parse_online_relays_rejects_empty_list() {
+        assert_eq!(parse_online_relays(200, "[]"), None);
     }
 }
