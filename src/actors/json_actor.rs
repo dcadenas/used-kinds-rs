@@ -32,7 +32,9 @@ pub enum JsonActorMessage {
     CleanupDocumentedKinds,
     ComputeClusters,
     ApplyClusters(HashMap<Kind, (u32, f64)>), // (cluster_id, similarity_score)
-    ClusteringFailed,
+    /// The clustering run ended — payloads written or the run aborted.
+    /// Releases the schedule and replays a coalesced request.
+    ClusteringFinished,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -52,7 +54,7 @@ pub struct State {
     http_actor: ActorRef<HttpActorMessage>,
     nostr_actor: ActorRef<NostrActorMessage>,
     recommended_apps: HashMap<Kind, Timestamp>,
-    clustering_in_progress: bool,
+    clustering: ClusteringSchedule,
     qdrant_client: qdrant_client::Qdrant, // Now required, not optional
 }
 
@@ -72,6 +74,40 @@ impl State {
         }
 
         Ok(())
+    }
+}
+
+/// Debounce-with-coalescing for clustering runs.
+///
+/// A recompute requested while one is running is remembered and replayed
+/// when the run finishes instead of being dropped. The old plain debounce
+/// silently lost the post-cleanup recompute whenever the 3h timer fired
+/// together with the 6h cleanup tick (3h divides 6h, and both intervals
+/// start at boot). The run is "finished" only after its payload writes
+/// complete, so a replayed run never overlaps an in-flight apply.
+#[derive(Debug, Default)]
+struct ClusteringSchedule {
+    in_progress: bool,
+    pending: bool,
+}
+
+impl ClusteringSchedule {
+    /// A recompute was requested; true when the caller must start one now.
+    fn request(&mut self) -> bool {
+        if self.in_progress {
+            self.pending = true;
+            false
+        } else {
+            self.in_progress = true;
+            true
+        }
+    }
+
+    /// The running recompute finished (applied or failed); true when a
+    /// coalesced request must be replayed.
+    fn finished(&mut self) -> bool {
+        self.in_progress = false;
+        std::mem::take(&mut self.pending)
     }
 }
 
@@ -415,10 +451,10 @@ impl Actor for JsonActor {
         });
         // Periodic recompute re-derives assignments from current vectors as
         // EMA updates drift them, overwriting or clearing stale incremental
-        // assignments. Keep the period an hour or more: the
-        // clustering_in_progress debounce clears when ApplyClusters is
-        // handled, before the spawned apply task finishes writing payloads,
-        // so a short period could overlap an in-flight apply.
+        // assignments. This timer aligns with the cleanup tick every 6h;
+        // that is safe because ClusteringSchedule coalesces requests that
+        // land mid-run and replays them when the run (including its payload
+        // writes) finishes — nothing is dropped.
         myself.send_interval(Duration::from_secs(60 * 60 * 3), || {
             JsonActorMessage::ComputeClusters
         });
@@ -479,7 +515,7 @@ impl Actor for JsonActor {
             http_actor,
             nostr_actor,
             recommended_apps,
-            clustering_in_progress: false,
+            clustering: ClusteringSchedule::default(),
             qdrant_client,
         };
 
@@ -866,13 +902,10 @@ impl Actor for JsonActor {
                 });
             }
             JsonActorMessage::ComputeClusters => {
-                // Debounce: skip if clustering is already running
-                if state.clustering_in_progress {
-                    debug!("Skipping clustering - already in progress");
+                if !state.clustering.request() {
+                    debug!("Clustering already in progress; queued a follow-up recompute");
                     return Ok(());
                 }
-
-                state.clustering_in_progress = true;
 
                 let client_clone = state.qdrant_client.clone();
                 let myself_clone = _myself.clone();
@@ -891,10 +924,10 @@ impl Actor for JsonActor {
                             Ok(points) => points,
                             Err(e) => {
                                 error!("Failed to scroll Qdrant points: {}", e);
-                                // Reset the debounce flag; a bare return here
+                                // Release the schedule; a bare return here
                                 // would disable re-clustering until restart.
                                 if let Err(e) =
-                                    cast!(myself_clone, JsonActorMessage::ClusteringFailed)
+                                    cast!(myself_clone, JsonActorMessage::ClusteringFinished)
                                 {
                                     error!("Failed to report clustering failure: {}", e);
                                 }
@@ -1104,23 +1137,27 @@ impl Actor for JsonActor {
             JsonActorMessage::ApplyClusters(clusters) => {
                 info!("Applying cluster results to {} kinds", clusters.len());
 
-                // Update Qdrant with cluster information
+                // Update Qdrant with cluster information. The schedule stays
+                // claimed until the writes are done, so a replayed recompute
+                // can never race an in-flight apply.
                 let client_clone = state.qdrant_client.clone();
+                let myself_clone = _myself.clone();
 
                 tokio::spawn(async move {
                     match apply_cluster_assignments(&client_clone, &clusters).await {
                         Ok(()) => info!("Successfully updated cluster information in Qdrant"),
                         Err(e) => error!("Failed to apply cluster assignments: {}", e),
                     }
+                    if let Err(e) = cast!(myself_clone, JsonActorMessage::ClusteringFinished) {
+                        error!("Failed to report clustering completion: {}", e);
+                    }
                 });
-
-                // Mark clustering as complete
-                state.clustering_in_progress = false;
             }
-            JsonActorMessage::ClusteringFailed => {
-                // The clustering task aborted before producing results; reset
-                // the debounce so the next ComputeClusters can run.
-                state.clustering_in_progress = false;
+            JsonActorMessage::ClusteringFinished => {
+                if state.clustering.finished() {
+                    info!("Replaying recompute request coalesced during the last run");
+                    _myself.send_message(JsonActorMessage::ComputeClusters)?;
+                }
             }
         }
 
@@ -1149,6 +1186,38 @@ mod tests {
             "a fetch error must not be treated as a confirmed-new point: \
              the count=1 path would overwrite the stored count and EMA vector"
         );
+    }
+
+    #[test]
+    fn test_clustering_schedule_starts_when_idle() {
+        let mut schedule = ClusteringSchedule::default();
+        assert!(schedule.request(), "idle schedule starts a run");
+        assert!(
+            !schedule.finished(),
+            "nothing was queued during the run, so no replay"
+        );
+        assert!(schedule.request(), "idle again after the run finished");
+    }
+
+    #[test]
+    fn test_clustering_schedule_coalesces_requests_made_mid_run() {
+        let mut schedule = ClusteringSchedule::default();
+        assert!(schedule.request());
+        assert!(
+            !schedule.request(),
+            "a request landing mid-run must not start a parallel run"
+        );
+        assert!(!schedule.request(), "many mid-run requests coalesce");
+        assert!(
+            schedule.finished(),
+            "the coalesced request replays when the run finishes \
+             (this is the post-cleanup recompute that the old debounce dropped)"
+        );
+        assert!(
+            schedule.request(),
+            "the replayed request claims the schedule"
+        );
+        assert!(!schedule.finished(), "the queue drained");
     }
 
     #[test]
