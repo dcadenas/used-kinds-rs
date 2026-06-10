@@ -31,6 +31,7 @@ pub enum JsonActorMessage {
     CleanupDocumentedKinds,
     ComputeClusters,
     ApplyClusters(HashMap<Kind, (u32, f64)>), // (cluster_id, similarity_score)
+    ClusteringFailed,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -192,6 +193,98 @@ async fn scroll_all_points(
     }
 
     Ok(points)
+}
+
+/// Persist cluster assignments and clear stale ones.
+///
+/// New assignments merge via `set_payload` so vectors and unrelated payload
+/// keys stay untouched. Points that carry an assignment from a previous run
+/// but are absent from `clusters` get their cluster fields deleted —
+/// otherwise a kind that falls out of a cluster keeps a stale badge forever.
+async fn apply_cluster_assignments(
+    client: &qdrant_client::Qdrant,
+    clusters: &HashMap<Kind, (u32, f64)>,
+) -> Result<()> {
+    use anyhow::Context;
+    use qdrant_client::qdrant::{
+        DeletePayloadPointsBuilder, PointId, PointsIdsList, SetPayloadPointsBuilder,
+    };
+    use std::collections::HashSet;
+
+    let collection = crate::qdrant_client::collection_name();
+
+    for (kind, (cluster_id, similarity)) in clusters {
+        let payload = qdrant_client::Payload::from(
+            serde_json::json!({
+                "cluster_id": cluster_id,
+                "cluster_similarity": similarity,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
+
+        client
+            .set_payload(
+                SetPayloadPointsBuilder::new(collection, payload)
+                    .points_selector(PointsIdsList {
+                        ids: vec![PointId::from(u16::from(*kind) as u64)],
+                    })
+                    .build(),
+            )
+            .await
+            .with_context(|| format!("Failed to set cluster payload for kind {}", kind))?;
+    }
+
+    let clustered: HashSet<u64> = clusters
+        .keys()
+        .map(|kind| u16::from(*kind) as u64)
+        .collect();
+
+    let mut stale_ids: Vec<PointId> = Vec::new();
+    for point in scroll_all_points(client, collection, true, false).await? {
+        let Some(num) = point.id.as_ref().and_then(|id| {
+            if let Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)) =
+                id.point_id_options.as_ref()
+            {
+                Some(*n)
+            } else {
+                None
+            }
+        }) else {
+            continue;
+        };
+
+        if clustered.contains(&num) {
+            continue;
+        }
+
+        if point.payload.contains_key("cluster_id")
+            || point.payload.contains_key("cluster_similarity")
+        {
+            stale_ids.push(PointId::from(num));
+        }
+    }
+
+    if !stale_ids.is_empty() {
+        info!(
+            "Clearing stale cluster assignment from {} points",
+            stale_ids.len()
+        );
+        client
+            .delete_payload(
+                DeletePayloadPointsBuilder::new(
+                    collection,
+                    vec!["cluster_id".to_string(), "cluster_similarity".to_string()],
+                )
+                .points_selector(PointsIdsList { ids: stale_ids })
+                .build(),
+            )
+            .await
+            .context("Failed to clear stale cluster payloads")?;
+    }
+
+    Ok(())
 }
 
 async fn query_all_from_qdrant(client: &qdrant_client::Qdrant) -> Result<Vec<(Kind, KindEntry)>> {
@@ -681,6 +774,13 @@ impl Actor for JsonActor {
                             Ok(points) => points,
                             Err(e) => {
                                 error!("Failed to scroll Qdrant points: {}", e);
+                                // Reset the debounce flag; a bare return here
+                                // would disable re-clustering until restart.
+                                if let Err(e) =
+                                    cast!(myself_clone, JsonActorMessage::ClusteringFailed)
+                                {
+                                    error!("Failed to report clustering failure: {}", e);
+                                }
                                 return;
                             }
                         };
@@ -889,72 +989,20 @@ impl Actor for JsonActor {
 
                 // Update Qdrant with cluster information
                 let client_clone = state.qdrant_client.clone();
-                let collection = crate::qdrant_client::collection_name().to_string();
-                let clusters_clone = clusters.clone();
 
                 tokio::spawn(async move {
-                    use qdrant_client::qdrant::{
-                        GetPointsBuilder, PointId, PointStruct, UpsertPointsBuilder,
-                    };
-
-                    for (kind, (cluster_id, similarity)) in clusters_clone {
-                        let kind_id: u64 = u16::from(kind) as u64;
-                        let point_id: PointId = kind_id.into();
-
-                        // Fetch current point to preserve existing data
-                        let get_request =
-                            GetPointsBuilder::new(&collection, vec![point_id.clone()])
-                                .with_payload(true)
-                                .with_vectors(true)
-                                .build();
-
-                        match client_clone.get_points(get_request).await {
-                            Ok(response) if !response.result.is_empty() => {
-                                let current_point = &response.result[0];
-
-                                // Merge cluster info into existing payload
-                                let mut payload = current_point.payload.clone();
-                                payload
-                                    .insert("cluster_id".to_string(), (cluster_id as i64).into());
-                                payload.insert("cluster_similarity".to_string(), similarity.into());
-
-                                // Get vector (should exist since we set it during RecordEvent)
-                                let vector = current_point.vectors.as_ref()
-                                        .and_then(|v| match v.vectors_options.as_ref()? {
-                                            qdrant_client::qdrant::vectors_output::VectorsOptions::Vector(vec) => Some(vec.data.clone()),
-                                            _ => None,
-                                        });
-
-                                if let Some(vector) = vector {
-                                    // Re-upsert with updated payload
-                                    let point = PointStruct::new(kind_id, vector, payload);
-                                    let upsert =
-                                        UpsertPointsBuilder::new(&collection, vec![point]).build();
-
-                                    if let Err(e) = client_clone.upsert_points(upsert).await {
-                                        error!(
-                                            "Failed to update cluster info for kind {}: {}",
-                                            kind, e
-                                        );
-                                    }
-                                }
-                            }
-                            Ok(_) => {
-                                debug!("Point {} not found, skipping cluster update", kind_id);
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to fetch point {} for cluster update: {}",
-                                    kind_id, e
-                                );
-                            }
-                        }
+                    match apply_cluster_assignments(&client_clone, &clusters).await {
+                        Ok(()) => info!("Successfully updated cluster information in Qdrant"),
+                        Err(e) => error!("Failed to apply cluster assignments: {}", e),
                     }
-
-                    info!("Successfully updated cluster information in Qdrant");
                 });
 
                 // Mark clustering as complete
+                state.clustering_in_progress = false;
+            }
+            JsonActorMessage::ClusteringFailed => {
+                // The clustering task aborted before producing results; reset
+                // the debounce so the next ComputeClusters can run.
                 state.clustering_in_progress = false;
             }
         }
@@ -989,5 +1037,111 @@ mod tests {
             Value::from(crate::similarity::FEATURE_VERSION),
         );
         assert!(!payload_needs_revectorization(&payload));
+    }
+
+    #[tokio::test]
+    #[ignore] // Only run when Qdrant is available locally
+    async fn test_apply_cluster_assignments_sets_new_and_clears_stale() {
+        use qdrant_client::qdrant::{
+            DeletePointsBuilder, GetPointsBuilder, PointId, PointStruct, UpsertPointsBuilder,
+        };
+
+        let client = crate::qdrant_client::initialize_qdrant().await.unwrap();
+        let collection = crate::qdrant_client::collection_name();
+
+        // Two points carrying a previous run's assignment; only one stays
+        // clustered after the recompute.
+        let mut points = Vec::new();
+        for kind in [64901u64, 64902u64] {
+            let payload = qdrant_client::Payload::from(
+                serde_json::json!({
+                    "kind": kind,
+                    "count": 5,
+                    "cluster_id": 999,
+                    "cluster_similarity": 0.5,
+                })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            );
+            let mut vector = vec![0.0f32; crate::qdrant_client::vector_size()];
+            vector[0] = 1.0;
+            points.push(PointStruct::new(kind, vector, payload));
+        }
+        client
+            .upsert_points(UpsertPointsBuilder::new(collection, points).build())
+            .await
+            .unwrap();
+
+        let mut clusters: HashMap<Kind, (u32, f64)> = HashMap::new();
+        clusters.insert(Kind::from(64901u16), (64901u32, 0.93f64));
+
+        apply_cluster_assignments(&client, &clusters).await.unwrap();
+
+        let got = client
+            .get_points(
+                GetPointsBuilder::new(
+                    collection,
+                    vec![PointId::from(64901u64), PointId::from(64902u64)],
+                )
+                .with_payload(true)
+                .build(),
+            )
+            .await
+            .unwrap();
+
+        let by_id: HashMap<u64, _> = got
+            .result
+            .into_iter()
+            .filter_map(|p| {
+                let num = p.id.as_ref().and_then(|id| {
+                    if let Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)) =
+                        id.point_id_options.as_ref()
+                    {
+                        Some(*n)
+                    } else {
+                        None
+                    }
+                })?;
+                Some((num, p.payload))
+            })
+            .collect();
+
+        let kept = &by_id[&64901];
+        assert_eq!(
+            kept.get("cluster_id").and_then(|v| v.as_integer()),
+            Some(64901)
+        );
+        let similarity = kept
+            .get("cluster_similarity")
+            .and_then(|v| v.as_double())
+            .unwrap();
+        assert!((similarity - 0.93).abs() < 1e-9);
+        assert_eq!(
+            kept.get("count").and_then(|v| v.as_integer()),
+            Some(5),
+            "merge must not clobber unrelated keys"
+        );
+
+        let cleared = &by_id[&64902];
+        assert!(
+            !cleared.contains_key("cluster_id"),
+            "stale cluster_id must be cleared"
+        );
+        assert!(!cleared.contains_key("cluster_similarity"));
+        assert_eq!(
+            cleared.get("count").and_then(|v| v.as_integer()),
+            Some(5),
+            "clearing must not touch unrelated keys"
+        );
+
+        client
+            .delete_points(
+                DeletePointsBuilder::new(collection)
+                    .points(vec![PointId::from(64901u64), PointId::from(64902u64)])
+                    .build(),
+            )
+            .await
+            .unwrap();
     }
 }
