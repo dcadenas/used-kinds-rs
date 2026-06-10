@@ -1,5 +1,7 @@
 services:
-  # Main Rust application (public web service)
+  # Single web service. Qdrant runs inside the same container (see
+  # Dockerfile + start.sh) with its storage on the persistent disk,
+  # so no extra private service is needed.
   - type: web
     name: used-kinds-rs
     runtime: docker
@@ -9,10 +11,7 @@ services:
       - key: PORT
         value: 8080
       - key: QDRANT_URL
-        fromService:
-          type: pserv
-          name: qdrant
-          property: hostport  # Resolves to qdrant:6334
+        value: http://127.0.0.1:6334
       - key: STATS_FILE
         value: /var/data/stats.json
       - key: RUST_LOG
@@ -22,20 +21,4 @@ services:
       mountPath: /var/data
       sizeGB: 2
     healthCheckPath: /health
-    autoDeploy: true  # Deploy on every push to main
-
-  # Qdrant vector database (private service - internal only)
-  - type: pserv
-    name: qdrant
-    runtime: image
-    image:
-      url: docker.io/qdrant/qdrant:latest
-    envVars:
-      - key: QDRANT__SERVICE__HTTP_PORT
-        value: 6333
-      - key: QDRANT__SERVICE__GRPC_PORT
-        value: 6334
-    disk:
-      name: qdrant-storage
-      mountPath: /qdrant/storage
-      sizeGB: 10
+    autoDeploy: true # Deploy on every push to main
