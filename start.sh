@@ -13,23 +13,38 @@ shutdown() {
 }
 trap shutdown TERM INT
 
+# Signal both processes, reap them, then exit. The reap matters: PID 1
+# exiting tears down the container's PID namespace and SIGKILLs anything
+# still flushing (qdrant). A trapped signal interrupts `wait` (>128), so
+# retry until every child is gone.
+die() {
+    code=$1
+    shift
+    if [ $# -gt 0 ]; then echo "$*" >&2; fi
+    shutdown
+    until wait; do :; done
+    exit "$code"
+}
+
 # Wait for qdrant to accept gRPC connections before starting the app;
 # the app hard-fails at startup if qdrant is unreachable.
+ready=""
 for _ in $(seq 1 60); do
     if (exec 3<>/dev/tcp/127.0.0.1/6334) 2>/dev/null; then
+        ready=1
         break
     fi
     if ! kill -0 "$qdrant_pid" 2>/dev/null; then
-        echo "qdrant exited before becoming ready" >&2
-        exit 1
+        die 1 "qdrant exited before becoming ready"
     fi
     sleep 1
 done
+if [ -z "$ready" ]; then
+    die 1 "qdrant not ready after 60s, giving up"
+fi
 
 /used-kinds-rs &
 app_pid=$!
 
 wait -n
-code=$?
-shutdown
-exit $code
+die $?
