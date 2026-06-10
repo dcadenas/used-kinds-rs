@@ -798,7 +798,9 @@
                         ascending = !ascending;
                     } else {
                         currentSort = sortBy;
-                        ascending = sortBy === 'kind' ? true : false;
+                        // Ascending groups clusters together; descending would put
+                        // unclustered cards (sentinel 999999) first.
+                        ascending = sortBy === 'kind' || sortBy === 'cluster';
                     }
 
                     sortButtons.forEach(b => b.classList.remove('active'));

@@ -77,18 +77,25 @@ fn is_old(unix_time: i64) -> bool {
     unix_time < (Utc::now() - chrono::Duration::days(30)).timestamp_millis()
 }
 
-/// Query all events from Qdrant
-async fn query_all_from_qdrant(client: &qdrant_client::Qdrant) -> Result<Vec<(Kind, KindEntry)>> {
+/// Scroll every point in a collection, following pagination.
+///
+/// The plain `.limit(N)` scroll silently truncates past N points, which is
+/// how clustering and cleanup previously missed kinds beyond the first 1000.
+async fn scroll_all_points(
+    client: &qdrant_client::Qdrant,
+    collection: &str,
+    with_payload: bool,
+    with_vectors: bool,
+) -> Result<Vec<qdrant_client::qdrant::RetrievedPoint>> {
     use qdrant_client::qdrant::ScrollPointsBuilder;
 
-    let collection = crate::qdrant_client::collection_name();
-    let mut results = Vec::new();
+    let mut points = Vec::new();
     let mut offset: Option<qdrant_client::qdrant::PointId> = None;
 
-    // Scroll through all points (paginated)
     loop {
         let mut scroll_builder = ScrollPointsBuilder::new(collection)
-            .with_payload(true)
+            .with_payload(with_payload)
+            .with_vectors(with_vectors)
             .limit(100);
 
         if let Some(offset_id) = offset {
@@ -96,34 +103,44 @@ async fn query_all_from_qdrant(client: &qdrant_client::Qdrant) -> Result<Vec<(Ki
         }
 
         let response = client.scroll(scroll_builder.build()).await?;
+        let is_empty = response.result.is_empty();
+        let next = response.next_page_offset.clone();
 
-        for point in &response.result {
-            let kind_num = point.id.as_ref().and_then(|id| {
-                if let qdrant_client::qdrant::point_id::PointIdOptions::Num(n) =
-                    id.point_id_options.as_ref()?
-                {
-                    Some(*n as u16)
-                } else {
-                    None
+        points.extend(response.result);
+
+        match next {
+            Some(next_offset) if !is_empty => offset = Some(next_offset),
+            _ => break,
+        }
+    }
+
+    Ok(points)
+}
+
+async fn query_all_from_qdrant(client: &qdrant_client::Qdrant) -> Result<Vec<(Kind, KindEntry)>> {
+    let collection = crate::qdrant_client::collection_name();
+    let mut results = Vec::new();
+
+    for point in scroll_all_points(client, collection, true, false).await? {
+        let kind_num = point.id.as_ref().and_then(|id| {
+            if let qdrant_client::qdrant::point_id::PointIdOptions::Num(n) =
+                id.point_id_options.as_ref()?
+            {
+                Some(*n as u16)
+            } else {
+                None
+            }
+        });
+
+        if let Some(kind_num) = kind_num {
+            match crate::qdrant_client::payload_to_kind_entry(&point.payload) {
+                Ok(entry) => {
+                    results.push((Kind::from(kind_num), entry));
                 }
-            });
-
-            if let Some(kind_num) = kind_num {
-                match crate::qdrant_client::payload_to_kind_entry(&point.payload) {
-                    Ok(entry) => {
-                        results.push((Kind::from(kind_num), entry));
-                    }
-                    Err(e) => {
-                        error!("Failed to deserialize kind {}: {}", kind_num, e);
-                    }
+                Err(e) => {
+                    error!("Failed to deserialize kind {}: {}", kind_num, e);
                 }
             }
-        }
-
-        // Check if there are more results
-        offset = response.result.last().and_then(|p| p.id.clone());
-        if response.result.is_empty() || response.next_page_offset.is_none() {
-            break;
         }
     }
 
@@ -285,12 +302,36 @@ impl Actor for JsonActor {
                         "event": event_clone.as_json(),
                     });
 
+                    // A plain count update must not wipe fields other flows maintain
+                    // (cluster assignment, recommended app).
+                    if let Some(ref point) = current_point {
+                        if let Some(app) = point
+                            .payload
+                            .get("recommended_app")
+                            .and_then(|v| v.as_str())
+                        {
+                            payload_json["recommended_app"] = serde_json::json!(app);
+                        }
+                        if let Some(cluster_id) =
+                            point.payload.get("cluster_id").and_then(|v| v.as_integer())
+                        {
+                            payload_json["cluster_id"] = serde_json::json!(cluster_id);
+                        }
+                        if let Some(sim) = point
+                            .payload
+                            .get("cluster_similarity")
+                            .and_then(|v| v.as_double())
+                        {
+                            payload_json["cluster_similarity"] = serde_json::json!(sim);
+                        }
+                    }
+
                     // For new events, search for similar events to assign cluster
                     if is_new_event {
                         let search_request =
                             SearchPointsBuilder::new(&collection, vector.clone(), 10)
                                 .score_threshold(0.8)
-                                .with_payload(false)
+                                .with_payload(true)
                                 .build();
 
                         if let Ok(response) = client_clone.search_points(search_request).await {
@@ -309,27 +350,38 @@ impl Actor for JsonActor {
                                 .collect();
 
                             // If we found similar neighbors, assign to their cluster
-                            if !neighbors.is_empty() {
-                                if let Some(first_neighbor) = neighbors.first() {
-                                    if let Some(neighbor_id) = first_neighbor.id.as_ref() {
-                                        if let Some(
-                                            qdrant_client::qdrant::point_id::PointIdOptions::Num(n),
-                                        ) = neighbor_id.point_id_options.as_ref()
-                                        {
-                                            let cluster_id = *n as u16;
-                                            let similarity = first_neighbor.score as f64;
-
-                                            payload_json["cluster_id"] =
-                                                serde_json::json!(cluster_id as i64);
-                                            payload_json["cluster_similarity"] =
-                                                serde_json::json!(similarity);
-
-                                            info!(
-                                                "New event kind {} assigned to cluster {}",
-                                                kind_u16, cluster_id
-                                            );
-                                        }
+                            if let Some(first_neighbor) = neighbors.first() {
+                                let neighbor_kind = first_neighbor.id.as_ref().and_then(|id| {
+                                    if let Some(
+                                        qdrant_client::qdrant::point_id::PointIdOptions::Num(n),
+                                    ) = id.point_id_options.as_ref()
+                                    {
+                                        Some(*n as i64)
+                                    } else {
+                                        None
                                     }
+                                });
+
+                                // Prefer the neighbor's existing cluster over its kind
+                                // number so incremental assignment matches the batch
+                                // clustering scheme (cluster id = lowest member kind).
+                                let cluster_id = first_neighbor
+                                    .payload
+                                    .get("cluster_id")
+                                    .and_then(|v| v.as_integer())
+                                    .or(neighbor_kind);
+
+                                if let Some(cluster_id) = cluster_id {
+                                    let similarity = first_neighbor.score as f64;
+
+                                    payload_json["cluster_id"] = serde_json::json!(cluster_id);
+                                    payload_json["cluster_similarity"] =
+                                        serde_json::json!(similarity);
+
+                                    info!(
+                                        "New event kind {} assigned to cluster {}",
+                                        kind_u16, cluster_id
+                                    );
                                 }
                             }
                         }
@@ -385,19 +437,14 @@ impl Actor for JsonActor {
                 let myself_clone = _myself.clone();
 
                 tokio::spawn(async move {
-                    use qdrant_client::qdrant::{DeletePointsBuilder, ScrollPointsBuilder};
+                    use qdrant_client::qdrant::DeletePointsBuilder;
 
                     // Scroll all points and check which to remove
-                    let scroll_request = ScrollPointsBuilder::new(&collection)
-                        .with_payload(true)
-                        .limit(1000)
-                        .build();
-
-                    match client_clone.scroll(scroll_request).await {
-                        Ok(response) => {
+                    match scroll_all_points(&client_clone, &collection, true, false).await {
+                        Ok(response_points) => {
                             let mut ids_to_remove = Vec::new();
 
-                            for point in response.result {
+                            for point in response_points {
                                 if let Some(kind_value) = point.payload.get("kind") {
                                     if let Some(kind_num) = kind_value.as_integer() {
                                         let kind = Kind::from(kind_num as u16);
@@ -482,25 +529,20 @@ impl Actor for JsonActor {
 
                 // Spawn background task for clustering using Qdrant similarity search
                 tokio::spawn(async move {
-                    use qdrant_client::qdrant::{ScrollPointsBuilder, SearchPointsBuilder};
+                    use qdrant_client::qdrant::SearchPointsBuilder;
                     use std::collections::{HashMap, HashSet};
 
                     info!("Computing similarity clusters using Qdrant search...");
 
                     // First, get all points WITH vectors
-                    let scroll_request = ScrollPointsBuilder::new(&collection)
-                        .limit(1000)
-                        .with_vectors(true)
-                        .with_payload(false)
-                        .build();
-
-                    let all_points = match client_clone.scroll(scroll_request).await {
-                        Ok(response) => response.result,
-                        Err(e) => {
-                            error!("Failed to scroll Qdrant points: {}", e);
-                            return;
-                        }
-                    };
+                    let all_points =
+                        match scroll_all_points(&client_clone, &collection, false, true).await {
+                            Ok(points) => points,
+                            Err(e) => {
+                                error!("Failed to scroll Qdrant points: {}", e);
+                                return;
+                            }
+                        };
 
                     info!("Found {} points to cluster", all_points.len());
 
