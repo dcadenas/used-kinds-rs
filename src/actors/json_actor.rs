@@ -336,6 +336,200 @@ fn payload_needs_revectorization(payload: &HashMap<String, qdrant_client::qdrant
         != Some(crate::similarity::FEATURE_VERSION)
 }
 
+/// Write one observed event for an undocumented kind into Qdrant.
+///
+/// `current_point` is the point fetched just before this call (`None` for a
+/// kind seen for the first time): its count feeds the increment and its
+/// vector the EMA blend.
+///
+/// An existing point is updated with `update_vectors` plus a `set_payload`
+/// merge of only the keys this flow owns (count, last_updated, event_id,
+/// event, feature_version) — the same merge pattern as
+/// `apply_cluster_assignments` and `set_recommended_app` — so cluster and
+/// app writes landing between the fetch and this persist are never
+/// reverted, which a whole-point upsert silently did. The vector goes
+/// first: stamping `feature_version` before a failed vector write would
+/// leave an old-encoding vector that boot-time re-vectorization no longer
+/// repairs. The count increment stays read-modify-write: two concurrent
+/// updates for one kind can lose an increment (and an EMA blend), accepted
+/// for approximate popularity counts rather than serializing per kind.
+async fn persist_recorded_event(
+    client: &qdrant_client::Qdrant,
+    collection: &str,
+    event: &Event,
+    current_point: Option<qdrant_client::qdrant::RetrievedPoint>,
+) -> Result<()> {
+    use anyhow::Context;
+    use nostr_sdk::JsonUtil;
+    use qdrant_client::qdrant::{
+        PointId, PointStruct, PointVectors, PointsIdsList, SearchPointsBuilder,
+        SetPayloadPointsBuilder, UpdatePointVectorsBuilder, UpsertPointsBuilder,
+    };
+
+    let kind_u16 = u16::from(event.kind);
+    let kind_id = u64::from(kind_u16);
+
+    let fresh_vector = crate::similarity::EventFeatures::from_event(event).to_vector();
+
+    if let Some(point) = current_point {
+        let count = point
+            .payload
+            .get("count")
+            .and_then(|v| v.as_integer())
+            .unwrap_or(0) as u64
+            + 1;
+
+        // Blend with the stored vector so one unusual event cannot teleport
+        // the kind across the feature space.
+        let stored_vector = if payload_needs_revectorization(&point.payload) {
+            None
+        } else {
+            point.vectors.as_ref().and_then(|v| {
+                if let Some(qdrant_client::qdrant::vectors_output::VectorsOptions::Vector(vec)) =
+                    &v.vectors_options
+                {
+                    Some(vec.data.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        let vector = match stored_vector {
+            Some(old) if old.len() == fresh_vector.len() => {
+                crate::similarity::blend_vectors(&old, &fresh_vector, 0.8)
+            }
+            _ => fresh_vector,
+        };
+
+        client
+            .update_vectors(
+                UpdatePointVectorsBuilder::new(
+                    collection.to_string(),
+                    vec![PointVectors {
+                        id: Some(PointId::from(kind_id)),
+                        vectors: Some(vector.into()),
+                    }],
+                )
+                .build(),
+            )
+            .await
+            .context("Failed to update point vector")?;
+
+        let payload = qdrant_client::Payload::from(
+            serde_json::json!({
+                "count": count,
+                "last_updated": Utc::now().timestamp_millis(),
+                "event_id": event.id.to_string(),
+                "event": event.as_json(),
+                "feature_version": crate::similarity::FEATURE_VERSION,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
+        client
+            .set_payload(
+                SetPayloadPointsBuilder::new(collection.to_string(), payload)
+                    .points_selector(PointsIdsList {
+                        ids: vec![PointId::from(kind_id)],
+                    })
+                    .build(),
+            )
+            .await
+            .context("Failed to merge event update payload")?;
+
+        return Ok(());
+    }
+
+    // First sighting: create the whole point. Nothing exists yet for other
+    // flows to have written, so an upsert is safe here.
+    let mut payload_json = serde_json::json!({
+        "kind": kind_u16,
+        "count": 1,
+        "last_updated": Utc::now().timestamp_millis(),
+        "recommended_app": null,  // Will be updated separately
+        "event_id": event.id.to_string(),
+        "event": event.as_json(),
+        "feature_version": crate::similarity::FEATURE_VERSION,
+    });
+
+    // Search for similar events to assign a cluster incrementally
+    let search_request = SearchPointsBuilder::new(collection, fresh_vector.clone(), 10)
+        .score_threshold(CLUSTER_SIMILARITY_THRESHOLD)
+        .with_payload(true)
+        .build();
+
+    if let Ok(response) = client.search_points(search_request).await {
+        // Filter out self (shouldn't exist yet, but be safe)
+        let neighbors: Vec<_> = response
+            .result
+            .iter()
+            .filter(|sp| {
+                sp.id
+                    .as_ref()
+                    .and_then(|id| {
+                        if let Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)) =
+                            id.point_id_options.as_ref()
+                        {
+                            Some(*n as u16 != kind_u16)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        // If we found similar neighbors, assign to their cluster
+        if let Some(first_neighbor) = neighbors.first() {
+            let neighbor_kind = first_neighbor.id.as_ref().and_then(|id| {
+                if let Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)) =
+                    id.point_id_options.as_ref()
+                {
+                    Some(*n as i64)
+                } else {
+                    None
+                }
+            });
+
+            // Prefer the neighbor's existing cluster over its kind
+            // number so incremental assignment matches the batch
+            // clustering scheme (cluster id = lowest member kind).
+            let cluster_id = incremental_cluster_id(
+                first_neighbor
+                    .payload
+                    .get("cluster_id")
+                    .and_then(|v| v.as_integer()),
+                neighbor_kind,
+                kind_u16,
+            );
+
+            if let Some(cluster_id) = cluster_id {
+                let similarity = first_neighbor.score as f64;
+
+                payload_json["cluster_id"] = serde_json::json!(cluster_id);
+                payload_json["cluster_similarity"] = serde_json::json!(similarity);
+
+                info!(
+                    "New event kind {} assigned to cluster {}",
+                    kind_u16, cluster_id
+                );
+            }
+        }
+    }
+
+    let payload =
+        qdrant_client::Payload::from(payload_json.as_object().cloned().unwrap_or_default());
+
+    let point = PointStruct::new(kind_id, fresh_vector, payload);
+    client
+        .upsert_points(UpsertPointsBuilder::new(collection.to_string(), vec![point]).build())
+        .await
+        .context("Failed to upsert new point")?;
+
+    Ok(())
+}
+
 /// Recompute vectors for points stored with an older featurizer version.
 ///
 /// The full event JSON lives in each payload, so this is mechanical. Without
@@ -765,18 +959,14 @@ impl Actor for JsonActor {
 
                 // Upsert to Qdrant with incremental clustering (async to avoid blocking actor)
                 tokio::spawn(async move {
-                    use nostr_sdk::JsonUtil;
-                    use qdrant_client::qdrant::{
-                        PointId, PointStruct, SearchPointsBuilder, UpsertPointsBuilder,
-                    };
+                    use qdrant_client::qdrant::{GetPointsBuilder, PointId};
 
                     // Fetch current point to get count
                     let point_id: PointId = kind_id.into();
-                    let get_request =
-                        qdrant_client::qdrant::GetPointsBuilder::new(&collection, vec![point_id])
-                            .with_payload(true)
-                            .with_vectors(true)
-                            .build();
+                    let get_request = GetPointsBuilder::new(&collection, vec![point_id])
+                        .with_payload(true)
+                        .with_vectors(true)
+                        .build();
 
                     let fetched = client_clone
                         .get_points(get_request)
@@ -795,158 +985,15 @@ impl Actor for JsonActor {
                         }
                     };
 
-                    let is_new_event = current_point.is_none();
-
-                    // Increment count or start at 1
-                    let count = if let Some(ref point) = current_point {
-                        point
-                            .payload
-                            .get("count")
-                            .and_then(|v| v.as_integer())
-                            .unwrap_or(0) as u64
-                            + 1
-                    } else {
-                        1
-                    };
-
-                    // Generate vector from event features, blended with the
-                    // stored vector so one unusual event cannot teleport the
-                    // kind across the feature space.
-                    let features = crate::similarity::EventFeatures::from_event(&event_clone);
-                    let fresh_vector = features.to_vector();
-
-                    let stored_vector = current_point
-                        .as_ref()
-                        .filter(|p| !payload_needs_revectorization(&p.payload))
-                        .and_then(|p| p.vectors.as_ref())
-                        .and_then(|v| {
-                            if let Some(
-                                qdrant_client::qdrant::vectors_output::VectorsOptions::Vector(vec),
-                            ) = &v.vectors_options
-                            {
-                                Some(vec.data.clone())
-                            } else {
-                                None
-                            }
-                        });
-
-                    let vector = match stored_vector {
-                        Some(old) if old.len() == fresh_vector.len() => {
-                            crate::similarity::blend_vectors(&old, &fresh_vector, 0.8)
-                        }
-                        _ => fresh_vector,
-                    };
-
-                    // Create base payload
-                    let mut payload_json = serde_json::json!({
-                        "kind": u16::from(event_clone.kind),
-                        "count": count,
-                        "last_updated": Utc::now().timestamp_millis(),
-                        "recommended_app": null,  // Will be updated separately
-                        "event_id": event_clone.id.to_string(),
-                        "event": event_clone.as_json(),
-                        "feature_version": crate::similarity::FEATURE_VERSION,
-                    });
-
-                    // A plain count update must not wipe fields other flows maintain
-                    // (cluster assignment, recommended app).
-                    if let Some(ref point) = current_point {
-                        if let Some(app) = point
-                            .payload
-                            .get("recommended_app")
-                            .and_then(|v| v.as_str())
-                        {
-                            payload_json["recommended_app"] = serde_json::json!(app);
-                        }
-                        if let Some(cluster_id) =
-                            point.payload.get("cluster_id").and_then(|v| v.as_integer())
-                        {
-                            payload_json["cluster_id"] = serde_json::json!(cluster_id);
-                        }
-                        if let Some(sim) = point
-                            .payload
-                            .get("cluster_similarity")
-                            .and_then(|v| v.as_double())
-                        {
-                            payload_json["cluster_similarity"] = serde_json::json!(sim);
-                        }
-                    }
-
-                    // For new events, search for similar events to assign cluster
-                    if is_new_event {
-                        let search_request =
-                            SearchPointsBuilder::new(&collection, vector.clone(), 10)
-                                .score_threshold(CLUSTER_SIMILARITY_THRESHOLD)
-                                .with_payload(true)
-                                .build();
-
-                        if let Ok(response) = client_clone.search_points(search_request).await {
-                            // Filter out self (shouldn't exist yet, but be safe)
-                            let neighbors: Vec<_> = response.result
-                                .iter()
-                                .filter(|sp| {
-                                    sp.id.as_ref().and_then(|id| {
-                                        if let Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)) = id.point_id_options.as_ref() {
-                                            Some(*n as u16 != kind_u16)
-                                        } else {
-                                            None
-                                        }
-                                    }).unwrap_or(false)
-                                })
-                                .collect();
-
-                            // If we found similar neighbors, assign to their cluster
-                            if let Some(first_neighbor) = neighbors.first() {
-                                let neighbor_kind = first_neighbor.id.as_ref().and_then(|id| {
-                                    if let Some(
-                                        qdrant_client::qdrant::point_id::PointIdOptions::Num(n),
-                                    ) = id.point_id_options.as_ref()
-                                    {
-                                        Some(*n as i64)
-                                    } else {
-                                        None
-                                    }
-                                });
-
-                                // Prefer the neighbor's existing cluster over its kind
-                                // number so incremental assignment matches the batch
-                                // clustering scheme (cluster id = lowest member kind).
-                                let cluster_id = incremental_cluster_id(
-                                    first_neighbor
-                                        .payload
-                                        .get("cluster_id")
-                                        .and_then(|v| v.as_integer()),
-                                    neighbor_kind,
-                                    kind_u16,
-                                );
-
-                                if let Some(cluster_id) = cluster_id {
-                                    let similarity = first_neighbor.score as f64;
-
-                                    payload_json["cluster_id"] = serde_json::json!(cluster_id);
-                                    payload_json["cluster_similarity"] =
-                                        serde_json::json!(similarity);
-
-                                    info!(
-                                        "New event kind {} assigned to cluster {}",
-                                        kind_u16, cluster_id
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    let payload = qdrant_client::Payload::from(
-                        payload_json.as_object().cloned().unwrap_or_default(),
-                    );
-
-                    // Upsert to Qdrant
-                    let point = PointStruct::new(kind_id, vector, payload);
-                    if let Err(e) = client_clone
-                        .upsert_points(UpsertPointsBuilder::new(collection, vec![point]).build())
-                        .await
+                    if let Err(e) = persist_recorded_event(
+                        &client_clone,
+                        &collection,
+                        &event_clone,
+                        current_point,
+                    )
+                    .await
                     {
-                        error!("Failed to upsert to Qdrant: {}", e);
+                        error!("Failed to persist event for kind {}: {:#}", kind_u16, e);
                     }
                 });
 
@@ -1547,6 +1594,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Only run when Qdrant is available locally
     async fn test_cleanup_recommended_app_sentinel_removes_only_sentinel_values() {
+        let _guard = crate::qdrant_client::QDRANT_TEST_GUARD.lock().await;
         use nostr_sdk::JsonUtil;
         use qdrant_client::qdrant::{
             DeletePointsBuilder, GetPointsBuilder, PointId, PointStruct, UpsertPointsBuilder,
@@ -1642,6 +1690,8 @@ mod tests {
         use qdrant_client::qdrant::{
             DeletePointsBuilder, GetPointsBuilder, PointId, PointStruct, UpsertPointsBuilder,
         };
+
+        let _guard = crate::qdrant_client::QDRANT_TEST_GUARD.lock().await;
 
         let client = crate::qdrant_client::initialize_qdrant().await.unwrap();
         let collection = crate::qdrant_client::collection_name();
@@ -1745,6 +1795,8 @@ mod tests {
             DeletePointsBuilder, GetPointsBuilder, PointId, PointStruct, UpsertPointsBuilder,
         };
 
+        let _guard = crate::qdrant_client::QDRANT_TEST_GUARD.lock().await;
+
         let client = crate::qdrant_client::initialize_qdrant().await.unwrap();
         let collection = crate::qdrant_client::collection_name();
 
@@ -1838,6 +1890,177 @@ mod tests {
             .delete_points(
                 DeletePointsBuilder::new(collection)
                     .points(vec![PointId::from(64901u64), PointId::from(64902u64)])
+                    .build(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Only run when Qdrant is available locally
+    async fn test_existing_point_update_preserves_concurrent_merge_writes() {
+        use nostr_sdk::JsonUtil;
+        use qdrant_client::qdrant::{
+            DeletePointsBuilder, GetPointsBuilder, PointId, PointStruct, PointsIdsList,
+            SetPayloadPointsBuilder, UpsertPointsBuilder,
+        };
+
+        let _guard = crate::qdrant_client::QDRANT_TEST_GUARD.lock().await;
+
+        let client = crate::qdrant_client::initialize_qdrant().await.unwrap();
+        let collection = crate::qdrant_client::collection_name();
+
+        let keys = Keys::generate();
+        let unsigned =
+            EventBuilder::new(Kind::from(64910u16), "first sighting").build(keys.public_key());
+        let old_event = keys.sign_event(unsigned).await.unwrap();
+
+        let mut old_vector = vec![0.0f32; crate::qdrant_client::vector_size()];
+        old_vector[0] = 1.0;
+        let payload = qdrant_client::Payload::from(
+            serde_json::json!({
+                "kind": 64910,
+                "count": 2,
+                "last_updated": 1,
+                "event_id": old_event.id.to_string(),
+                "event": old_event.as_json(),
+                "feature_version": crate::similarity::FEATURE_VERSION,
+            })
+            .as_object()
+            .cloned()
+            .unwrap(),
+        );
+        client
+            .upsert_points(
+                UpsertPointsBuilder::new(
+                    collection,
+                    vec![PointStruct::new(64910u64, old_vector.clone(), payload)],
+                )
+                .build(),
+            )
+            .await
+            .unwrap();
+
+        // The update flow snapshots the point first...
+        let fetched = client
+            .get_points(
+                GetPointsBuilder::new(collection, vec![PointId::from(64910u64)])
+                    .with_payload(true)
+                    .with_vectors(true)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let snapshot = fetched.result.into_iter().next().expect("seeded point");
+
+        // ...then the clustering and recommended-app flows land their
+        // merge-writes before the update is persisted. They must survive.
+        let race_payload = qdrant_client::Payload::from(
+            serde_json::json!({
+                "cluster_id": 7,
+                "cluster_similarity": 0.91,
+                "recommended_app": "RaceApp",
+            })
+            .as_object()
+            .cloned()
+            .unwrap(),
+        );
+        client
+            .set_payload(
+                SetPayloadPointsBuilder::new(collection, race_payload)
+                    .points_selector(PointsIdsList {
+                        ids: vec![PointId::from(64910u64)],
+                    })
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let unsigned = EventBuilder::new(Kind::from(64910u16), "second sighting, longer body")
+            .build(keys.public_key());
+        let new_event = keys.sign_event(unsigned).await.unwrap();
+
+        persist_recorded_event(&client, collection, &new_event, Some(snapshot))
+            .await
+            .unwrap();
+
+        let got = client
+            .get_points(
+                GetPointsBuilder::new(collection, vec![PointId::from(64910u64)])
+                    .with_payload(true)
+                    .with_vectors(true)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let point = got.result.first().expect("point exists");
+
+        // Keys owned by other flows, written mid-flight, must survive.
+        assert_eq!(
+            point.payload.get("cluster_id").and_then(|v| v.as_integer()),
+            Some(7),
+            "a cluster assignment landing between fetch and persist must survive"
+        );
+        let similarity = point
+            .payload
+            .get("cluster_similarity")
+            .and_then(|v| v.as_double())
+            .expect("cluster_similarity survives");
+        assert!((similarity - 0.91).abs() < 1e-9);
+        assert_eq!(
+            point
+                .payload
+                .get("recommended_app")
+                .and_then(|v| v.as_str())
+                .map(String::as_str),
+            Some("RaceApp"),
+            "a recommended app landing between fetch and persist must survive"
+        );
+
+        // Keys owned by this flow are updated.
+        assert_eq!(
+            point.payload.get("count").and_then(|v| v.as_integer()),
+            Some(3)
+        );
+        assert_eq!(
+            point.payload.get("event").and_then(|v| v.as_str()),
+            Some(&new_event.as_json())
+        );
+        assert_eq!(
+            point.payload.get("event_id").and_then(|v| v.as_str()),
+            Some(&new_event.id.to_string())
+        );
+        assert!(
+            point
+                .payload
+                .get("last_updated")
+                .and_then(|v| v.as_integer())
+                .unwrap()
+                > 1
+        );
+
+        // The vector is the EMA blend of the stored and fresh vectors.
+        let fresh = crate::similarity::EventFeatures::from_event(&new_event).to_vector();
+        let expected = crate::similarity::blend_vectors(&old_vector, &fresh, 0.8);
+        let stored = point
+            .vectors
+            .as_ref()
+            .and_then(|v| match v.vectors_options.as_ref() {
+                Some(qdrant_client::qdrant::vectors_output::VectorsOptions::Vector(vec)) => {
+                    Some(vec.data.clone())
+                }
+                _ => None,
+            })
+            .expect("vector present");
+        assert_eq!(stored.len(), expected.len());
+        for (s, e) in stored.iter().zip(expected.iter()) {
+            assert!((s - e).abs() < 1e-6, "vector must be the EMA blend");
+        }
+
+        client
+            .delete_points(
+                DeletePointsBuilder::new(collection)
+                    .points(vec![PointId::from(64910u64)])
                     .build(),
             )
             .await

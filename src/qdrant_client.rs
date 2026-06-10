@@ -297,6 +297,13 @@ pub fn payload_to_kind_entry(
     })
 }
 
+/// Serializes the `#[ignore]` Qdrant integration tests. Disjoint point ids
+/// are not enough isolation: cluster apply/clear, re-vectorization and
+/// sentinel cleanup scan the whole collection, so tests running in parallel
+/// mutate each other's points.
+#[cfg(test)]
+pub(crate) static QDRANT_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,11 +371,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Needs a local Qdrant whose nostr_events collection is EMPTY; run alone:
-              // cargo test test_migrate_filters -- --ignored
+    #[ignore] // Needs a local Qdrant whose nostr_events collection is EMPTY
+              // apart from other tests' cleaned-up points: migration
+              // short-circuits when points exist.
     async fn test_migrate_filters_stale_and_documented_entries() {
         use qdrant_client::qdrant::{DeletePointsBuilder, GetPointsBuilder, PointId};
 
+        let _guard = QDRANT_TEST_GUARD.lock().await;
         let client = initialize_qdrant().await.unwrap();
 
         let info = client.collection_info(COLLECTION_NAME).await.unwrap();
@@ -457,6 +466,7 @@ mod tests {
             DeletePointsBuilder, GetPointsBuilder, PointId, PointStruct, UpsertPointsBuilder,
         };
 
+        let _guard = QDRANT_TEST_GUARD.lock().await;
         let client = initialize_qdrant().await.unwrap();
 
         // Seed a point whose existing payload must survive the merge
@@ -521,6 +531,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Only run when Qdrant is available locally
     async fn test_initialize_qdrant() {
+        let _guard = QDRANT_TEST_GUARD.lock().await;
         let result = initialize_qdrant().await;
         assert!(result.is_ok());
 
