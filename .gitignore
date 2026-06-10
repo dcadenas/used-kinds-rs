@@ -1,5 +1,6 @@
 /target
 stats.json
+stats.json.migrated
 qdrant_storage/
 nips_kinds_cache.json
 .DS_Store
