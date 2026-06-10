@@ -31,7 +31,7 @@ pub async fn initialize_qdrant() -> Result<Qdrant> {
         info!("Creating collection: {}", COLLECTION_NAME);
 
         // Create collection with dense vector configuration
-        client
+        let created = client
             .create_collection(
                 CreateCollectionBuilder::new(COLLECTION_NAME)
                     .vectors_config(VectorsConfig {
@@ -41,10 +41,25 @@ pub async fn initialize_qdrant() -> Result<Qdrant> {
                     })
                     .build(),
             )
-            .await
-            .context("Failed to create collection")?;
+            .await;
 
-        info!("Collection created successfully");
+        match created {
+            Ok(_) => info!("Collection created successfully"),
+            // The exists-check and the create are not atomic: a concurrent
+            // initializer (parallel tests share one Qdrant) can win the race.
+            // Losing it is fine as long as the collection is there now.
+            Err(e) => {
+                let exists_now = client
+                    .collection_exists(COLLECTION_NAME)
+                    .await
+                    .unwrap_or(false);
+                if exists_now {
+                    info!("Collection '{}' was created concurrently", COLLECTION_NAME);
+                } else {
+                    return Err(e).context("Failed to create collection");
+                }
+            }
+        }
     } else {
         info!("Collection '{}' already exists", COLLECTION_NAME);
     }
