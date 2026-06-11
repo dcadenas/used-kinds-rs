@@ -11,6 +11,12 @@ const NIPS_README_URL: &str =
     "https://raw.githubusercontent.com/nostr-protocol/nips/master/README.md";
 const CACHE_DURATION_HOURS: i64 = 24;
 
+/// Hard deadline for the README fetch. main awaits this on the boot path
+/// before any actor (or the health endpoint) starts, so without a deadline
+/// a hung connection stalls startup forever; an error instead falls back
+/// to the cached/static kind list.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 lazy_static! {
     static ref DOCUMENTED_KINDS: RwLock<DocumentedKinds> = RwLock::new(DocumentedKinds::default());
 }
@@ -70,11 +76,21 @@ impl DocumentedKinds {
     }
 }
 
+/// Fetch the README body, failing instead of hanging past `timeout`.
+async fn fetch_readme(url: &str, timeout: std::time::Duration) -> Result<String> {
+    let response = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()?
+        .get(url)
+        .send()
+        .await?;
+    Ok(response.text().await?)
+}
+
 pub async fn fetch_and_update_kinds() -> Result<()> {
     info!("Fetching latest NIPs documentation from GitHub");
 
-    let response = reqwest::get(NIPS_README_URL).await?;
-    let content = response.text().await?;
+    let content = fetch_readme(NIPS_README_URL, FETCH_TIMEOUT).await?;
 
     let kinds = parse_kinds_from_readme(&content)?;
 
@@ -275,6 +291,24 @@ mod tests {
         assert!(kinds.contains(5500));
         assert!(!kinds.contains(4));
         assert!(!kinds.contains(250));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_readme_times_out_instead_of_hanging() {
+        // A bound listener nobody accepts on: the OS backlog completes the
+        // TCP handshake but no HTTP response ever arrives. Without a client
+        // deadline this await hangs forever — the boot-path failure mode.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fetch_readme(&url, std::time::Duration::from_millis(250)),
+        )
+        .await
+        .expect("fetch must hit its own deadline, not hang");
+
+        assert!(result.is_err(), "silent server must yield a timeout error");
     }
 
     #[test]

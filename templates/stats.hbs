@@ -274,6 +274,30 @@
             font-weight: 500;
         }
 
+        .cluster-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.375rem;
+            padding: 0.25rem 0.75rem;
+            background: var(--purple);  /* Default, will be overridden by JS */
+            border: 2px solid transparent;
+            border-radius: 1rem;
+            font-size: 0.75rem;
+            color: white;
+            font-weight: 600;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+            transition: all 0.2s;
+        }
+
+        .cluster-badge:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.4);
+        }
+
+        .cluster-kind-number {
+            font-weight: 700;
+        }
+
         .event-id {
             font-family: 'Monaco', 'Menlo', monospace;
             font-size: 0.8125rem;
@@ -469,6 +493,12 @@
             display: none !important;
         }
 
+        /* Highlight clustered kinds with subtle purple glow */
+        .kind-card[data-cluster]:not([data-cluster="null"]):not([data-cluster=""]) {
+            border-left: 3px solid var(--purple);
+            box-shadow: 0 0 10px rgba(139, 92, 246, 0.1);
+        }
+
         /* Scrollbar styling */
         ::-webkit-scrollbar {
             width: 10px;
@@ -528,17 +558,21 @@
                     <i class="fas fa-clock"></i>
                     <span>Sort by Time</span>
                 </button>
+                <button class="sort-button" data-sort="cluster">
+                    <i class="fas fa-layer-group"></i>
+                    <span>Sort by Cluster</span>
+                </button>
             </div>
         </div>
 
         <div class="cards-container" id="cardsContainer">
             {{#each stats}}
-            <div class="kind-card" data-kind="{{this.[0]}}" data-count="{{this.[1].count}}" data-time="{{this.[1].last_updated}}" data-app="{{this.[1].recommended_app}}" data-event="{{this.[1].event.id}}">
+            <div class="kind-card" data-kind="{{this.[0]}}" data-count="{{this.[1].count}}" data-time="{{this.[1].last_updated}}" data-app="{{this.[1].recommended_app}}" data-event="{{this.[1].event.id}}" data-cluster="{{this.[1].cluster_id}}">
                 <div class="card-header">
                     <div class="kind-number">
                         <a href="https://github.com/search?q=repo%3Anostr-protocol%2Fnips++%2Fkind.*%5Cb{{this.[0]}}%5Cb%2F&type=code"
                            class="github-link" target="_blank" title="Search in NIPs">
-                            #{{this.[0]}}
+                            Kind {{this.[0]}}
                         </a>
                     </div>
                     <i class="fas fa-chevron-down expand-icon"></i>
@@ -550,6 +584,13 @@
                         <span class="app-badge">
                             <i class="fas fa-check-circle"></i>
                             {{this.[1].recommended_app}}
+                        </span>
+                    </div>
+                    {{/if}}
+                    {{#if this.[1].cluster_id}}
+                    <div class="info-row">
+                        <span class="cluster-badge" data-cluster-id="{{this.[1].cluster_id}}">
+                            Similarity cluster: Kind <span class="cluster-kind-number">{{this.[1].cluster_id}}</span>
                         </span>
                     </div>
                     {{/if}}
@@ -599,6 +640,36 @@
 
             let currentSort = 'kind';
             let ascending = true;
+
+            // Generate consistent colors for cluster IDs
+            function getClusterColor(clusterId) {
+                const colors = [
+                    '#8b5cf6', // purple
+                    '#3b82f6', // blue
+                    '#10b981', // green
+                    '#f59e0b', // orange
+                    '#ef4444', // red
+                    '#ec4899', // pink
+                    '#6366f1', // indigo
+                    '#14b8a6', // teal
+                    '#f97316', // orange-red
+                    '#a855f7', // purple-light
+                ];
+
+                // Use cluster ID to pick color (stable across refreshes)
+                const index = parseInt(clusterId) % colors.length;
+                return colors[index];
+            }
+
+            // Apply colors to cluster badges
+            document.querySelectorAll('.cluster-badge').forEach(badge => {
+                const clusterId = badge.dataset.clusterId;
+                if (clusterId && clusterId !== 'null' && clusterId !== '') {
+                    const color = getClusterColor(clusterId);
+                    badge.style.background = color;
+                    badge.style.borderColor = color;
+                }
+            });
 
             // Lazy decode and highlight JSON only when card is expanded
             function decodeAndHighlightCard(card) {
@@ -698,6 +769,19 @@
                             aVal = parseInt(a.dataset.time);
                             bVal = parseInt(b.dataset.time);
                             break;
+                        case 'cluster':
+                            // Sort by cluster_id (nulls last), then by kind within cluster
+                            const aCluster = a.dataset.cluster && a.dataset.cluster !== 'null' ? parseInt(a.dataset.cluster) : 999999;
+                            const bCluster = b.dataset.cluster && b.dataset.cluster !== 'null' ? parseInt(b.dataset.cluster) : 999999;
+                            if (aCluster === bCluster) {
+                                // Same cluster, sort by kind number
+                                aVal = parseInt(a.dataset.kind);
+                                bVal = parseInt(b.dataset.kind);
+                            } else {
+                                aVal = aCluster;
+                                bVal = bCluster;
+                            }
+                            break;
                     }
 
                     return ascending ? aVal - bVal : bVal - aVal;
@@ -714,7 +798,9 @@
                         ascending = !ascending;
                     } else {
                         currentSort = sortBy;
-                        ascending = sortBy === 'kind' ? true : false;
+                        // Ascending groups clusters together; descending would put
+                        // unclustered cards (sentinel 999999) first.
+                        ascending = sortBy === 'kind' || sortBy === 'cluster';
                     }
 
                     sortButtons.forEach(b => b.classList.remove('active'));

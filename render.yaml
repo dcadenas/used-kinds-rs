@@ -1,0 +1,24 @@
+services:
+  # Single web service. Qdrant runs inside the same container (see
+  # Dockerfile + start.sh) with its storage on the persistent disk,
+  # so no extra private service is needed.
+  - type: web
+    name: used-kinds-rs
+    runtime: docker
+    repo: https://github.com/dcadenas/used-kinds-rs
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: QDRANT_URL
+        value: http://127.0.0.1:6334
+      - key: STATS_FILE
+        value: /var/data/stats.json
+      - key: RUST_LOG
+        value: info
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 2
+    healthCheckPath: /health
+    autoDeploy: true # Deploy on every push to main
